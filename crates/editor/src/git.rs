@@ -2930,6 +2930,52 @@ impl Editor {
     }
 }
 
+impl Editor {
+    /// Fork hook for the Plannotator review crate: takes all stored review
+    /// comments with their file path and 1-based buffer line range.
+    pub fn take_review_comments_for_export(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<ExportedReviewComment> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let to_buffer_row = |anchor: &Anchor| {
+            let point = anchor.to_point(&snapshot);
+            snapshot
+                .point_to_buffer_point(point)
+                .map(|(_, p)| p.row)
+                .unwrap_or(point.row)
+        };
+        let mut exported = Vec::new();
+        // Same as the test-only `take_all_review_comments`.
+        self.dismiss_all_diff_review_overlays(cx);
+        let taken = std::mem::take(&mut self.stored_review_comments);
+        self.next_review_comment_id = 0;
+        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+        cx.notify();
+        for (key, comments) in taken {
+            for comment in comments {
+                exported.push(ExportedReviewComment {
+                    file_path: key.file_path.as_unix_str().to_string(),
+                    line_start: to_buffer_row(&comment.range.start) + 1,
+                    line_end: to_buffer_row(&comment.range.end) + 1,
+                    text: comment.comment,
+                });
+            }
+        }
+        exported
+    }
+}
+
+/// A review comment taken out of the editor for sending elsewhere.
+#[derive(Clone, Debug)]
+pub struct ExportedReviewComment {
+    /// Path relative to the worktree root, with `/` separators.
+    pub file_path: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub text: String,
+}
+
 impl EditorSnapshot {
     pub(super) fn display_diff_hunks_for_rows<'a>(
         &'a self,

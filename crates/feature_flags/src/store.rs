@@ -103,7 +103,8 @@ impl FeatureFlagStore {
     /// Debug builds are always treated as staff, and `ZED_DISABLE_STAFF`
     /// forces the user to be treated as non-staff for testing.
     pub fn overrides_enabled(&self) -> bool {
-        (cfg!(debug_assertions) || self.staff) && !*ZED_DISABLE_STAFF
+        // Fork: a personal build honors overrides in release builds too, so `diff-review` can be on.
+        !*ZED_DISABLE_STAFF
     }
 
     pub fn server_flags_received(&self) -> bool {

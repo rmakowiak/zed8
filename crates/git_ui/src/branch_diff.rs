@@ -425,7 +425,7 @@ impl BranchDiff {
             .detach_and_notify_err(workspace, window, cx);
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    // Fork: public so the Plannotator review crate can read review comments.
     pub fn editor(&self, cx: &App) -> Entity<SplittableEditor> {
         self.diff.read(cx).editor().clone()
     }

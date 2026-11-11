@@ -13496,6 +13496,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plannotator_review"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "buffer_diff",
+ "editor",
+ "file_icons",
+ "git_ui",
+ "git_ui_core",
+ "gpui",
+ "http_client",
+ "language",
+ "libc",
+ "log",
+ "multi_buffer",
+ "notifications",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "tempfile",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "platform_title_bar"
 version = "0.1.0"
 dependencies = [
@@ -22524,6 +22551,7 @@ dependencies = [
  "paths",
  "picker",
  "pkg-config",
+ "plannotator_review",
  "pretty_assertions",
  "profiling",
  "project",
