@@ -59,7 +59,8 @@ Mockup (approved 2026-11-11, version 3): https://claude.ai/artifact/8E1RRDc2xRn5
    - If the send fails, the comments go to `~/.plannotator/zed-unsent/<ms>.md`.
    - Tested 2026-11-11: "Send review" in the branch diff sent 5 comments to a waiting `plannotator review --json` session, with file paths and line numbers.
 3. Extend the Plannotator client: read guides, drafts and the reviewed state.
-4. Add the Review dock panel and the chapter mode in the branch diff. In progress: the dock panel and the chapter tabs work. Claude's notes show as foldable blocks in the chapter tab (2026-11-11). A new-side note goes below its last line. An old-side note goes above its diff hunk.
+4. Add the Review dock panel and the chapter mode in the branch diff. In progress: the dock panel and the chapter tabs work. Claude's notes show as foldable blocks in the chapter tab (2026-11-11). A new-side note goes below its last line. An old-side note goes above its diff hunk. You can reply to a note. Replies are saved in `~/.plannotator/zed-drafts/` and go to Claude with the review comments.
+   - "Review PR" (panel button, or `plannotator_review: review pr` in the command palette) types `/zed-guided-review` into a Zed terminal that runs Claude Code. The skill `~/.claude/skills/zed-guided-review` tells Claude to write the guide, import it, and start the session with `--gate`. The panel finds the PR with `gh pr view`. Not tested yet.
 5. Add spec review in the markdown preview.
 
 ## Fork changes to upstream files
@@ -77,6 +78,7 @@ Keep this list short. Each item is a thin hook.
 - cmake is in a private venv, linked to `~/.local/bin/cmake`.
 - Without Xcode, build with runtime shaders: `cargo build -p zed --features gpui_platform/runtime_shaders`.
 - The debug build is slow to use. For daily use, build `--profile release-fast` (optimized, no link-time optimization). The binary is `target/release-fast/zed`.
+- If Claude Code starts the fork, remove the `CLAUDE*` and `AI_AGENT` environment variables first (`env -u …`). If you do not, Claude Code in a fork terminal acts as a child session and does not save its transcript.
 - Run the fork with its own data folder: `zed --user-data-dir ~/workspace/zed-dev-data`. Its `config` folder is a copy of `~/.config/zed`, with `"feature_flags": {"diff-review": "on"}` added. The extensions and the Claude Code agent come from `~/Library/Application Support/Zed`.
 
 ## Todo

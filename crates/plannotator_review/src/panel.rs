@@ -5,6 +5,7 @@ use crate::{
     chapter_view::{ChapterDiffView, ChapterKey},
     guide::{self, LoadedGuide},
     session::{self, Session},
+    start::{self, PullRequest},
 };
 use anyhow::Result;
 use editor::{EditorEvent, actions::SendReviewToAgent};
@@ -20,7 +21,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use file_icons::FileIcons;
-use ui::{Checkbox, Disclosure, TintColor, ToggleState, prelude::*};
+use ui::{Checkbox, Disclosure, TintColor, ToggleState, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
@@ -45,6 +46,8 @@ struct PanelState {
     guide: Option<LoadedGuide>,
     /// Git status and line counts of the guide's files, by path.
     file_stats: HashMap<String, FileStat>,
+    /// The GitHub PR of the branch. Looked up again only when the branch changes.
+    pr: Option<PullRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -72,26 +75,48 @@ pub struct ReviewPanel {
 }
 
 impl ReviewPanel {
-    pub fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
+    pub fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let workspace_handle = workspace.weak_handle();
         let http: Arc<dyn HttpClient> = workspace.client().http_client();
-        let poll = cx.spawn(async move |this, cx| {
+        let poll = cx.spawn_in(window, async move |this, cx| {
+            let mut first_load = true;
             loop {
-                let Ok(roots) = this.update(cx, |this, cx| this.worktree_roots(cx)) else {
+                let Ok((roots, previous)) = this.update(cx, |this, cx| {
+                    (
+                        this.worktree_roots(cx),
+                        (this.state.branch.clone(), this.state.pr.clone()),
+                    )
+                }) else {
                     return;
                 };
                 let state = cx
                     .background_executor()
-                    .spawn(async move { load_state(roots) })
+                    .spawn(async move { load_state(roots, previous) })
                     .await;
-                let updated = this.update(cx, |this, cx| {
+                let Ok((reveal, workspace)) = this.update(cx, |this, cx| {
+                    // A new guide or a new session means Claude just started a review.
+                    let guide_id = |state: &PanelState| state.guide.as_ref().map(|guide| guide.id.clone());
+                    let session_pid = |state: &PanelState| state.session.as_ref().map(|session| session.pid);
+                    let reveal = !first_load
+                        && ((guide_id(&state).is_some() && guide_id(&state) != guide_id(&this.state))
+                            || (session_pid(&state).is_some()
+                                && session_pid(&state) != session_pid(&this.state)));
                     if this.state != state {
                         this.state = state;
                         cx.notify();
                     }
-                });
-                if updated.is_err() {
+                    (reveal, this.workspace.clone())
+                }) else {
                     return;
+                };
+                first_load = false;
+                if reveal {
+                    // Opens the dock without taking focus from the Claude terminal.
+                    workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            workspace.reveal_panel::<ReviewPanel>(window, cx)
+                        })
+                        .log_err();
                 }
                 cx.background_executor().timer(POLL_INTERVAL).await;
             }
@@ -299,7 +324,23 @@ impl ReviewPanel {
             .gap_0p5()
             .border_b_1()
             .border_color(colors.border_variant)
-            .child(Label::new(title).weight(FontWeight::MEDIUM))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(div().flex_1().min_w_0().child(Label::new(title).weight(FontWeight::MEDIUM)))
+                    .when(self.state.guide.is_some() && self.state.pr.is_some(), |row| {
+                        row.child(
+                            IconButton::new("new-guide", IconName::RotateCw)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Ask Claude for a new guide"))
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(start::ReviewPr), cx)
+                                }),
+                        )
+                    }),
+            )
             .child(Label::new(meta).size(LabelSize::Small).color(Color::Muted))
             .child(
                 h_flex()
@@ -307,6 +348,37 @@ impl ReviewPanel {
                     .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall).color(Color::Muted))
                     .child(Label::new(branch).size(LabelSize::Small).color(Color::Muted)),
             )
+    }
+
+    /// The empty state: a "Review PR" button, or why there is none.
+    fn render_start(&self, cx: &App) -> impl IntoElement {
+        let section = Self::render_section("Chapters".to_string(), cx);
+        match &self.state.pr {
+            Some(pr) => section
+                .child(
+                    Label::new(format!("No guide yet for PR #{}: {}", pr.number, pr.title))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Button::new("review-pr", format!("Review PR #{}", pr.number))
+                        .style(ButtonStyle::Filled)
+                        .full_width()
+                        .on_click(|_, window, cx| window.dispatch_action(Box::new(start::ReviewPr), cx)),
+                )
+                .child(
+                    Label::new("Claude Code in a Zed terminal writes the guide.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            None => section
+                .child(Button::new("review-pr", "Review PR").full_width().disabled(true))
+                .child(
+                    Label::new("This branch has no open GitHub PR.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        }
     }
 
     fn render_session(&self, cx: &App) -> impl IntoElement {
@@ -318,16 +390,26 @@ impl ReviewPanel {
                     session.url.trim_start_matches("http://localhost:")
                 ),
             ),
-            None => (
-                Color::Muted,
-                "No review session. Ask Claude to start one.".to_string(),
-            ),
+            None => (Color::Muted, "No review session".to_string()),
         };
+        let can_start = self.state.session.is_none() && self.state.guide.is_some();
         Self::render_section("Sends to".to_string(), cx).child(
             h_flex()
+                .w_full()
                 .gap_1p5()
                 .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(color))
-                .child(Label::new(text).size(LabelSize::Small)),
+                .child(div().flex_1().child(Label::new(text).size(LabelSize::Small)))
+                .when(can_start, |row| {
+                    row.child(
+                        Button::new("start-session", "Start session")
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text("Ask Claude to start a review session for this guide"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(start::StartSession), cx)
+                            }),
+                    )
+                }),
         )
     }
 
@@ -616,7 +698,10 @@ fn relative_time(saved_at_ms: u64) -> String {
     }
 }
 
-fn load_state(roots: Vec<PathBuf>) -> PanelState {
+fn load_state(
+    roots: Vec<PathBuf>,
+    (previous_branch, previous_pr): (Option<String>, Option<PullRequest>),
+) -> PanelState {
     let root = roots.first().cloned();
     let git = |args: &[&str]| -> Option<String> {
         let output = std::process::Command::new("git")
@@ -661,12 +746,18 @@ fn load_state(roots: Vec<PathBuf>) -> PanelState {
             stat.removed = removed.parse().unwrap_or(0);
         }
     }
+    let pr = if branch.is_some() && branch == previous_branch {
+        previous_pr
+    } else {
+        root.as_deref().and_then(start::find_pull_request)
+    };
     PanelState {
         roots,
         branch,
         session,
         guide,
         file_stats,
+        pr,
     }
 }
 
@@ -690,13 +781,7 @@ impl Render for ReviewPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.state.guide.clone() {
             Some(guide) => self.render_chapters(&guide, cx).into_any_element(),
-            None => Self::render_section("Chapters".to_string(), cx)
-                .child(
-                    Label::new("No guide for this branch yet. Ask Claude to write one with Plannotator.")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .into_any_element(),
+            None => self.render_start(cx).into_any_element(),
         };
         v_flex()
             .key_context("PlannotatorReviewPanel")

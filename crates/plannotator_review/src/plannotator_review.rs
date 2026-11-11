@@ -11,6 +11,7 @@ mod guide;
 mod note_thread;
 mod panel;
 mod session;
+mod start;
 
 use anyhow::{Context as _, Result, bail};
 use editor::{Editor, ExportedReviewComment, actions::SendReviewToAgent};
@@ -28,6 +29,7 @@ use workspace::Workspace;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        start::init(workspace);
         workspace
             .register_action(send_review)
             .register_action(|workspace, _: &panel::ToggleFocus, window, cx| {
@@ -36,7 +38,7 @@ pub fn init(cx: &mut App) {
         let Some(window) = window else {
             return;
         };
-        let review_panel = cx.new(|cx| panel::ReviewPanel::new(workspace, cx));
+        let review_panel = cx.new(|cx| panel::ReviewPanel::new(workspace, window, cx));
         workspace.add_panel(review_panel, window, cx);
     })
     .detach();
