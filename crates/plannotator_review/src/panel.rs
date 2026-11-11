@@ -18,7 +18,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use file_icons::FileIcons;
 use ui::{Checkbox, Disclosure, TintColor, ToggleState, Tooltip, prelude::*};
@@ -37,6 +37,8 @@ actions!(
 );
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// `gh` calls GitHub, so the PR is looked up less often than local state.
+const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Default, PartialEq)]
 struct PanelState {
@@ -46,8 +48,11 @@ struct PanelState {
     guide: Option<LoadedGuide>,
     /// Git status and line counts of the guide's files, by path.
     file_stats: HashMap<String, FileStat>,
-    /// The GitHub PR of the branch. Looked up again only when the branch changes.
+    /// The local HEAD commit.
+    head: Option<String>,
+    /// The GitHub PR of the branch, from `gh`. See `PR_REFRESH_INTERVAL`.
     pr: Option<PullRequest>,
+    pr_checked_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -82,10 +87,7 @@ impl ReviewPanel {
             let mut first_load = true;
             loop {
                 let Ok((roots, previous)) = this.update(cx, |this, cx| {
-                    (
-                        this.worktree_roots(cx),
-                        (this.state.branch.clone(), this.state.pr.clone()),
-                    )
+                    (this.worktree_roots(cx), this.state.clone())
                 }) else {
                     return;
                 };
@@ -348,6 +350,28 @@ impl ReviewPanel {
                     .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall).color(Color::Muted))
                     .child(Label::new(branch).size(LabelSize::Small).color(Color::Muted)),
             )
+            .when_some(self.head_mismatch(), |header, pr_head| {
+                header.child(
+                    h_flex()
+                        .gap_1()
+                        .child(Icon::new(IconName::Warning).size(IconSize::XSmall).color(Color::Warning))
+                        .child(
+                            Label::new(format!(
+                                "Local HEAD is not the PR head ({}). Pull or push first.",
+                                &pr_head[..pr_head.len().min(7)]
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                        ),
+                )
+            })
+    }
+
+    /// The PR head commit when it differs from the local HEAD.
+    fn head_mismatch(&self) -> Option<String> {
+        let pr = self.state.pr.as_ref()?;
+        let head = self.state.head.as_ref()?;
+        (&pr.head_ref_oid != head).then(|| pr.head_ref_oid.clone())
     }
 
     /// The empty state: a "Review PR" button, or why there is none.
@@ -698,10 +722,7 @@ fn relative_time(saved_at_ms: u64) -> String {
     }
 }
 
-fn load_state(
-    roots: Vec<PathBuf>,
-    (previous_branch, previous_pr): (Option<String>, Option<PullRequest>),
-) -> PanelState {
+fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
     let root = roots.first().cloned();
     let git = |args: &[&str]| -> Option<String> {
         let output = std::process::Command::new("git")
@@ -746,10 +767,16 @@ fn load_state(
             stat.removed = removed.parse().unwrap_or(0);
         }
     }
-    let pr = if branch.is_some() && branch == previous_branch {
-        previous_pr
+    let pr_is_fresh = branch.is_some()
+        && branch == previous.branch
+        && head == previous.head
+        && previous
+            .pr_checked_at
+            .is_some_and(|checked| checked.elapsed() < PR_REFRESH_INTERVAL);
+    let (pr, pr_checked_at) = if pr_is_fresh {
+        (previous.pr, previous.pr_checked_at)
     } else {
-        root.as_deref().and_then(start::find_pull_request)
+        (root.as_deref().and_then(start::find_pull_request), Some(Instant::now()))
     };
     PanelState {
         roots,
@@ -757,7 +784,9 @@ fn load_state(
         session,
         guide,
         file_stats,
+        head,
         pr,
+        pr_checked_at,
     }
 }
 

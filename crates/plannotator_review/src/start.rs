@@ -28,13 +28,15 @@ pub struct PullRequest {
     pub number: u64,
     pub url: String,
     pub title: String,
+    /// The last commit of the PR on GitHub.
+    pub head_ref_oid: String,
 }
 
 /// The open GitHub PR of the checked-out branch, from the `gh` CLI.
 pub fn find_pull_request(root: &Path) -> Option<PullRequest> {
     let output = std::process::Command::new("gh")
         .current_dir(root)
-        .args(["pr", "view", "--json", "number,url,title"])
+        .args(["pr", "view", "--json", "number,url,title,headRefOid"])
         .output()
         .ok()?;
     if !output.status.success() {
