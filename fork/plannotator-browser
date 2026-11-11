@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Plannotator browser hook for the Zed fork.
+
+Plannotator runs this with the session URL when PLANNOTATOR_BROWSER is its
+path. If a running fork Zed has the session's worktree open (code review),
+or any fork Zed runs (spec review of a markdown file), Zed takes the session
+and no browser opens. Otherwise the browser in ZED_FALLBACK_BROWSER opens.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+FALLBACK = os.environ.get("ZED_FALLBACK_BROWSER", "Google Chrome")
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def session_for(url):
+    # The session file can appear a moment after the browser call.
+    for _ in range(20):
+        for path in glob.glob(f"{HOME}/.plannotator/sessions/*.json"):
+            session = read(path)
+            if session and session.get("url") == url:
+                return session
+        time.sleep(0.1)
+    return None
+
+
+def zed_roots():
+    roots = []
+    for path in glob.glob(f"{HOME}/.plannotator/zed-windows/*.json"):
+        window = read(path)
+        if window and alive(window.get("pid", 0)):
+            roots.extend(window.get("roots", []))
+        elif window:
+            os.remove(path)
+    return [os.path.realpath(root) for root in roots]
+
+
+def zed_takes(session):
+    roots = zed_roots()
+    if not roots or not session:
+        return False
+    target = os.path.realpath(session.get("target") or "")
+    if session.get("mode") == "annotate":
+        return target.endswith((".md", ".mdx", ".markdown"))
+    if session.get("mode") == "review":
+        return any(target == root or target.startswith(root + os.sep) for root in roots)
+    return False
+
+
+def main():
+    url = sys.argv[-1]
+    if zed_takes(session_for(url)):
+        return
+    subprocess.run(["open", "-a", FALLBACK, url], check=False)
+
+
+main()

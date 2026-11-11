@@ -8,9 +8,14 @@
 mod chapter_view;
 mod feedback;
 mod guide;
+mod input;
 mod note_thread;
 mod panel;
+mod rich_text;
 mod session;
+mod spec_doc;
+mod spec_store;
+mod spec_view;
 mod start;
 
 use anyhow::{Context as _, Result, bail};
@@ -158,7 +163,7 @@ pub(crate) fn show_toast(workspace: &mut Workspace, message: impl Into<String>, 
     workspace.toggle_status_toast(toast, cx);
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)

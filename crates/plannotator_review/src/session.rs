@@ -1,4 +1,5 @@
-//! Finds the live Plannotator review session for a worktree.
+//! Finds live Plannotator sessions: the code review of a worktree, and the
+//! spec reviews (annotate sessions on a markdown file).
 //!
 //! Each Plannotator server writes `~/.plannotator/sessions/<pid>.json`. A file
 //! can outlive its process, so a session counts only while its pid runs.
@@ -51,6 +52,39 @@ fn find_review_session_with(
         })
         .filter(|session| is_alive(session.pid))
         .max_by(|a, b| a.started_at.cmp(&b.started_at))
+}
+
+/// Live annotate sessions on a markdown file, oldest first. A spec can live
+/// anywhere (often in Claude's scratchpad), so there is no worktree filter.
+pub fn find_spec_sessions(dir: &Path) -> Vec<Session> {
+    find_spec_sessions_with(dir, process_is_alive)
+}
+
+fn find_spec_sessions_with(dir: &Path, is_alive: impl Fn(i32) -> bool) -> Vec<Session> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut sessions: Vec<Session> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "json" {
+                return None;
+            }
+            serde_json::from_slice::<Session>(&std::fs::read(&path).ok()?).ok()
+        })
+        .filter(|session| session.mode == "annotate")
+        .filter(|session| {
+            session.target.as_deref().is_some_and(|target| {
+                matches!(
+                    Path::new(target).extension().and_then(|ext| ext.to_str()),
+                    Some("md" | "mdx" | "markdown")
+                )
+            })
+        })
+        .filter(|session| is_alive(session.pid))
+        .collect();
+    sessions.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    sessions
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -110,5 +144,17 @@ mod tests {
             find_review_session_with(sessions.path(), &[worktree.path().to_path_buf()], |_| true)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn finds_live_spec_sessions_on_markdown() {
+        let sessions = tempfile::tempdir().unwrap();
+        let docs = tempfile::tempdir().unwrap();
+        write(sessions.path(), 1, "annotate", &docs.path().join("spec.md"), "2026-01-02");
+        write(sessions.path(), 2, "annotate", &docs.path().join("page.html"), "2026-01-03");
+        write(sessions.path(), 3, "annotate", &docs.path().join("old.md"), "2026-01-01");
+        write(sessions.path(), 4, "review", docs.path(), "2026-01-04");
+        let found = find_spec_sessions_with(sessions.path(), |pid| pid != 3);
+        assert_eq!(found.iter().map(|session| session.pid).collect::<Vec<_>>(), vec![1]);
     }
 }

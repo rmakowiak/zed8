@@ -5,6 +5,7 @@ use crate::{
     chapter_view::{ChapterDiffView, ChapterKey},
     guide::{self, LoadedGuide},
     session::{self, Session},
+    spec_view::SpecReviewView,
     start::{self, PullRequest},
 };
 use anyhow::Result;
@@ -24,7 +25,7 @@ use file_icons::FileIcons;
 use ui::{Checkbox, Disclosure, TintColor, ToggleState, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
-    Workspace,
+    SaveIntent, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
@@ -48,6 +49,8 @@ struct PanelState {
     guide: Option<LoadedGuide>,
     /// Git status and line counts of the guide's files, by path.
     file_stats: HashMap<String, FileStat>,
+    /// Live spec reviews (annotate sessions on markdown), oldest first.
+    specs: Vec<Session>,
     /// The local HEAD commit.
     head: Option<String>,
     /// The GitHub PR of the branch, from `gh`. See `PR_REFRESH_INTERVAL`.
@@ -85,6 +88,10 @@ impl ReviewPanel {
         let http: Arc<dyn HttpClient> = workspace.client().http_client();
         let poll = cx.spawn_in(window, async move |this, cx| {
             let mut first_load = true;
+            let Ok(window_key) = this.update(cx, |_, cx| format!("{}-{}", std::process::id(), cx.entity_id()))
+            else {
+                return;
+            };
             loop {
                 let Ok((roots, previous)) = this.update(cx, |this, cx| {
                     (this.worktree_roots(cx), this.state.clone())
@@ -93,21 +100,37 @@ impl ReviewPanel {
                 };
                 let state = cx
                     .background_executor()
-                    .spawn(async move { load_state(roots, previous) })
+                    .spawn({
+                        let window_key = window_key.clone();
+                        async move {
+                        announce_roots(&window_key, &roots);
+                        load_state(roots, previous)
+                    }})
                     .await;
-                let Ok((reveal, workspace)) = this.update(cx, |this, cx| {
+                let Ok((reveal, new_specs, workspace)) = this.update(cx, |this, cx| {
                     // A new guide or a new session means Claude just started a review.
                     let guide_id = |state: &PanelState| state.guide.as_ref().map(|guide| guide.id.clone());
                     let session_pid = |state: &PanelState| state.session.as_ref().map(|session| session.pid);
+                    let new_specs: Vec<Session> = if first_load {
+                        Vec::new()
+                    } else {
+                        state
+                            .specs
+                            .iter()
+                            .filter(|spec| !this.state.specs.iter().any(|old| old.pid == spec.pid))
+                            .cloned()
+                            .collect()
+                    };
                     let reveal = !first_load
                         && ((guide_id(&state).is_some() && guide_id(&state) != guide_id(&this.state))
                             || (session_pid(&state).is_some()
-                                && session_pid(&state) != session_pid(&this.state)));
+                                && session_pid(&state) != session_pid(&this.state))
+                            || !new_specs.is_empty());
                     if this.state != state {
                         this.state = state;
                         cx.notify();
                     }
-                    (reveal, this.workspace.clone())
+                    (reveal, new_specs, this.workspace.clone())
                 }) else {
                     return;
                 };
@@ -118,6 +141,10 @@ impl ReviewPanel {
                         .update_in(cx, |workspace, window, cx| {
                             workspace.reveal_panel::<ReviewPanel>(window, cx)
                         })
+                        .log_err();
+                }
+                for spec in new_specs {
+                    this.update_in(cx, |this, window, cx| this.open_spec(spec, false, window, cx))
                         .log_err();
                 }
                 cx.background_executor().timer(POLL_INTERVAL).await;
@@ -264,6 +291,98 @@ impl ReviewPanel {
         if let Some(view) = reused {
             self.watch_chapter(&view, cx);
         }
+    }
+
+    /// Opens the spec review tab of `spec`, or activates it if it is open.
+    /// Claude starting a spec review opens it without focus.
+    fn open_spec(&mut self, spec: Session, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let http = self.http.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let existing = workspace
+                    .items_of_type::<SpecReviewView>(cx)
+                    .find(|view| view.read(cx).session_pid() == spec.pid);
+                if let Some(view) = existing {
+                    workspace.activate_item(&view, true, focus, window, cx);
+                    return;
+                }
+                // A finished earlier round of the same file is closed.
+                let finished: Vec<_> = workspace
+                    .items_of_type::<SpecReviewView>(cx)
+                    .filter(|view| {
+                        let view = view.read(cx);
+                        view.is_finished() && view.target() == spec.target.as_deref()
+                    })
+                    .collect();
+                let view = cx.new(|cx| SpecReviewView::new(spec, http, window, cx));
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.add_item(Box::new(view), true, focus, None, window, cx);
+                });
+                for old in finished {
+                    for pane in workspace.panes().to_vec() {
+                        pane.update(cx, |pane, cx| {
+                            if pane.index_for_item(&old).is_some() {
+                                pane.close_item_by_id(old.entity_id(), SaveIntent::Skip, window, cx)
+                                    .detach();
+                            }
+                        });
+                    }
+                }
+            })
+            .log_err();
+    }
+
+    fn render_specs(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.state.specs.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let hover = colors.ghost_element_hover;
+        let rows: Vec<AnyElement> = self
+            .state
+            .specs
+            .iter()
+            .map(|spec| {
+                let target = spec.target.clone().unwrap_or_default();
+                let name = Path::new(&target)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("spec")
+                    .to_string();
+                let dir = Path::new(&target)
+                    .parent()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default();
+                let spec = spec.clone();
+                h_flex()
+                    .id(("spec", spec.pid as usize))
+                    .w_full()
+                    .px_1()
+                    .py_0p5()
+                    .gap_1p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .tooltip(Tooltip::text(target.clone()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_spec(spec.clone(), true, window, cx)
+                    }))
+                    .child(Icon::new(IconName::FileMarkdown).size(IconSize::Small).color(Color::Accent))
+                    .child(Label::new(name).size(LabelSize::Small))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(dir).size(LabelSize::XSmall).color(Color::Muted).truncate_start()),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            Self::render_section("Spec review · Claude waits".to_string(), cx)
+                .child(v_flex().gap_0p5().children(rows))
+                .into_any_element(),
+        )
     }
 
     /// Keeps the Send feedback count in step with the open chapter tab.
@@ -722,6 +841,18 @@ fn relative_time(saved_at_ms: u64) -> String {
     }
 }
 
+/// Tells the browser hook (`fork/plannotator-browser`) which worktrees this
+/// window has open, so Plannotator sessions there stay in Zed.
+fn announce_roots(window_key: &str, roots: &[PathBuf]) {
+    let dir = util::paths::home_dir().join(".plannotator").join("zed-windows");
+    let body = serde_json::json!({ "pid": std::process::id(), "roots": roots });
+    let result = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(dir.join(format!("{window_key}.json")), body.to_string()));
+    if let Err(error) = result {
+        log::warn!("plannotator: cannot announce worktrees: {error}");
+    }
+}
+
 fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
     let root = roots.first().cloned();
     let git = |args: &[&str]| -> Option<String> {
@@ -739,6 +870,7 @@ fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
     let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
     let head = git(&["rev-parse", "HEAD"]);
     let session = session::find_review_session(&session::sessions_dir(), &roots);
+    let specs = session::find_spec_sessions(&session::sessions_dir());
     let guide = guide::find_guide(&guide::guides_dir(), branch.as_deref(), head.as_deref());
     let mut file_stats = HashMap::default();
     let base = guide
@@ -784,6 +916,7 @@ fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
         session,
         guide,
         file_stats,
+        specs,
         head,
         pr,
         pr_checked_at,
@@ -818,6 +951,7 @@ impl Render for ReviewPanel {
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(self.render_header(cx))
+            .children(self.render_specs(cx))
             .child(self.render_session(cx))
             .child(
                 v_flex()

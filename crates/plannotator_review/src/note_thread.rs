@@ -2,7 +2,8 @@
 //! replies under it as a thread. Replies go to Claude with the review comments.
 
 use crate::guide::GuideNote;
-use editor::{Editor, ExportedReviewComment, actions::Newline};
+use editor::{Editor, ExportedReviewComment};
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, Render,
     SharedString, Subscription, Window, px,
@@ -25,12 +26,13 @@ pub struct NoteThread {
     note: GuideNote,
     lines: SharedString,
     text: SharedString,
+    body: Entity<Markdown>,
     /// Every reply. The first `sent` are already with Claude.
     replies: Vec<String>,
     sent: usize,
     collapsed: bool,
     input: Entity<Editor>,
-    _input_subscription: Subscription,
+    _input_subscriptions: [Subscription; 2],
 }
 
 impl NoteThread {
@@ -41,26 +43,19 @@ impl NoteThread {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Reply to Claude…", window, cx);
-            editor
-        });
-        let thread = cx.entity().downgrade();
-        let subscription = input.update(cx, |input, _| {
-            input.register_action(move |_: &Newline, window, cx| {
-                thread
-                    .update(cx, |thread, cx| thread.submit(window, cx))
-                    .ok();
-            })
-        });
+        let (input, input_subscriptions) =
+            crate::input::single_line("Reply to Claude…", window, cx, Self::submit);
         let lines = if note.line_start == note.line_end {
             format!("line {}", note.line_start)
         } else {
             format!("lines {}–{}", note.line_start, note.line_end)
         };
+        let body = cx.new(|cx| {
+            Markdown::new(crate::rich_text::render_mermaid(&note.text).into(), None, None, cx)
+        });
         Self {
             file,
+            body,
             text: note.text.clone().into(),
             note,
             lines: lines.into(),
@@ -68,7 +63,7 @@ impl NoteThread {
             replies: draft.replies,
             collapsed: false,
             input,
-            _input_subscription: subscription,
+            _input_subscriptions: input_subscriptions,
         }
     }
 
@@ -184,7 +179,8 @@ impl Focusable for NoteThread {
 }
 
 impl Render for NoteThread {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let colors = cx.theme().colors();
         let accent = colors.text_accent;
         let (border_variant, editor_background, text_muted, text_color) = (
@@ -267,8 +263,7 @@ impl Render for NoteThread {
                         div()
                             .pl_5()
                             .text_color(text_color)
-                            .line_height(px(21.))
-                            .child(self.text.clone()),
+                            .child(MarkdownElement::new(self.body.clone(), body_style)),
                     )
                     .when(!replies.is_empty(), |thread| {
                         thread.child(
