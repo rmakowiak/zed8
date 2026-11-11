@@ -19,10 +19,6 @@ pub struct Session {
     pub started_at: String,
 }
 
-pub fn sessions_dir() -> PathBuf {
-    util::paths::home_dir().join(".plannotator").join("sessions")
-}
-
 /// The newest live review session whose target is one of `roots`, or inside one.
 pub fn find_review_session(dir: &Path, roots: &[PathBuf]) -> Option<Session> {
     find_review_session_with(dir, roots, process_is_alive)
@@ -34,15 +30,8 @@ fn find_review_session_with(
     is_alive: impl Fn(i32) -> bool,
 ) -> Option<Session> {
     let roots: Vec<PathBuf> = roots.iter().map(|root| canonical(root)).collect();
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            if path.extension()? != "json" {
-                return None;
-            }
-            serde_json::from_slice::<Session>(&std::fs::read(&path).ok()?).ok()
-        })
+    read_sessions(dir)
+        .into_iter()
         .filter(|session| session.mode == "review")
         .filter(|session| {
             session.target.as_deref().is_some_and(|target| {
@@ -61,17 +50,8 @@ pub fn find_spec_sessions(dir: &Path) -> Vec<Session> {
 }
 
 fn find_spec_sessions_with(dir: &Path, is_alive: impl Fn(i32) -> bool) -> Vec<Session> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut sessions: Vec<Session> = entries
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            if path.extension()? != "json" {
-                return None;
-            }
-            serde_json::from_slice::<Session>(&std::fs::read(&path).ok()?).ok()
-        })
+    let mut sessions: Vec<Session> = read_sessions(dir)
+        .into_iter()
         .filter(|session| session.mode == "annotate")
         .filter(|session| {
             session.target.as_deref().is_some_and(|target| {
@@ -85,6 +65,22 @@ fn find_spec_sessions_with(dir: &Path, is_alive: impl Fn(i32) -> bool) -> Vec<Se
         .collect();
     sessions.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     sessions
+}
+
+/// Every session file that parses. Dead sessions are still in the list.
+fn read_sessions(dir: &Path) -> Vec<Session> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "json" {
+                return None;
+            }
+            serde_json::from_slice::<Session>(&std::fs::read(&path).ok()?).ok()
+        })
+        .collect()
 }
 
 fn canonical(path: &Path) -> PathBuf {

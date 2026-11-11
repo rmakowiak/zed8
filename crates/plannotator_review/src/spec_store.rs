@@ -69,10 +69,6 @@ pub fn record_path(dir: &Path, spec_path: &str) -> PathBuf {
     dir.join(format!("spec-{name}-{hash:016x}.json"))
 }
 
-pub fn drafts_dir() -> PathBuf {
-    util::paths::home_dir().join(".plannotator").join("zed-drafts")
-}
-
 pub fn load(path: &Path) -> SpecRecord {
     std::fs::read(path)
         .ok()

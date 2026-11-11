@@ -51,17 +51,35 @@ Mockup (approved 2026-11-11, version 3): https://claude.ai/artifact/8E1RRDc2xRn5
 
 ## Plan
 
-1. Build stock Zed in debug mode and turn on `diff-review`. Try the inline comments on a real PR. Done 2026-11-11: the debug build takes about 7 minutes. The comment box works in the branch diff. It is a single-line input with an avatar, a cancel button and a submit button, and it has no comment types yet.
-2. Send feedback to the Plannotator session instead of the Agent panel (was step 4, moved up on 2026-11-11 to get one full loop first). In progress on branch `plannotator-review`:
-   - The crate `crates/plannotator_review` reads `~/.plannotator/sessions/` and posts to `/api/feedback`.
-   - It uses the newest session with mode `review`, a target inside the worktree, and a running pid.
-   - Upstream has no handler for `SendReviewToAgent`. The button dispatches it and nothing happens. Our crate is the only handler.
+All five steps work, tested by hand on 2026-11-11 against PR #43508 and a test spec.
+
+1. Stock Zed with `diff-review` on. Done: the inline comment box works in the branch diff.
+2. Send to Plannotator. Done:
+   - "Send review" posts the inline comments to the newest live `review` session of the worktree (`/api/feedback`).
+   - Upstream has no handler for `SendReviewToAgent`, so this crate is the only one.
    - If the send fails, the comments go to `~/.plannotator/zed-unsent/<ms>.md`.
-   - Tested 2026-11-11: "Send review" in the branch diff sent 5 comments to a waiting `plannotator review --json` session, with file paths and line numbers.
-3. Extend the Plannotator client: read guides, drafts and the reviewed state.
-4. Add the Review dock panel and the chapter mode in the branch diff. In progress: the dock panel and the chapter tabs work. Claude's notes show as foldable blocks in the chapter tab (2026-11-11). A new-side note goes below its last line. An old-side note goes above its diff hunk. You can reply to a note. Replies are saved in `~/.plannotator/zed-drafts/` and go to Claude with the review comments.
-   - "Review PR" (panel button, or `plannotator_review: review pr` in the command palette) types `/zed-guided-review` into a Zed terminal that runs Claude Code. The skill `~/.claude/skills/zed-guided-review` tells Claude to write the guide, import it, and start the session with `--gate`. The panel finds the PR with `gh pr view`. Not tested yet.
-5. Add spec review in the markdown preview.
+3. Plannotator client. Done: guides, reviewed ticks (session API, or the guide file without a session), reply drafts and spec drafts.
+4. Review panel and chapters. Done:
+   - The dock panel shows the guide, its chapters with reviewed ticks, the session, and the Claude thread.
+   - A chapter opens a diff tab with only its files. Claude's notes are inline threads that you can reply to.
+   - "Review PR" (panel button or command palette) and "Start session" type `/zed-guided-review` into the Claude Code terminal thread of the Agent panel, or into a terminal that runs `claude`. If none runs, Zed starts `claude` in a new terminal with the command.
+   - The skill `~/.claude/skills/zed-guided-review` writes the guide, imports it, and starts the session with `--gate`.
+   - The panel warns when the local HEAD is not the PR head.
+   - The panel opens without focus when a new guide or session appears.
+5. Spec review. Done:
+   - An annotate session on a markdown file opens a spec tab by itself.
+   - You comment on blocks and answer `:::question` blocks. Approve and Send feedback use Plannotator's export format.
+   - A new round marks the changed blocks and shows the last round's comments as resolved or still open.
+
+## Where the build differs from the decisions
+
+- Chapters open in their own diff tab, not inside the branch diff view. The branch diff has no hook for a file subset.
+- Mermaid renders as a text diagram with `~/.local/bin/mermaid-ascii`, not as an image with `mmdc`. `mmdc` needs a headless Chromium.
+- Spec review is its own tab, not the markdown preview. The preview has no hook for comments and question cards.
+- "Review PR" is in the Review panel and the command palette, not in the git panel or the branch diff toolbar. Those need upstream hooks.
+- The panel shows the Claude thread that Zed types into. Plannotator sessions do not record which thread started them, so there is no thread picker.
+- Plannotator keeps no record of earlier comments. Zed keeps the last sent round in `~/.plannotator/zed-drafts/` and compares it with the new text.
+- The browser fallback needs `PLANNOTATOR_BROWSER` set to `fork/plannotator-browser` (see "Turn on the browser hook").
 
 ## Fork changes to upstream files
 
@@ -72,14 +90,38 @@ Keep this list short. Each item is a thin hook.
 - `crates/git_ui/src/branch_diff.rs`: `BranchDiff::editor` is public, not test-only.
 - `Cargo.toml`, `crates/zed/Cargo.toml`, `crates/zed/src/main.rs`: register the crate and call `plannotator_review::init`.
 
+The crate reads the Agent panel (`visible_terminal_view`), the terminal panel and the markdown crate through their public APIs, with no hooks.
+
+## Crate layout
+
+- `panel.rs` and `panel_state.rs`: the Review panel and the state that it polls every 2 seconds.
+- `chapter_view.rs` and `note_thread.rs`: the chapter diff tab and the reply threads on Claude's notes.
+- `spec_view.rs`, `spec_doc.rs` and `spec_store.rs`: the spec review tab, the spec parser and export, and the drafts and rounds.
+- `start.rs`: "Review PR" and "Start session", which ask Claude Code.
+- `session.rs`, `guide.rs`, `client.rs`, `paths.rs`: Plannotator sessions, guides, HTTP and folders.
+- `feedback.rs`, `rich_text.rs`, `input.rs`: the code review export, markdown with mermaid, and the one-line input.
+
+## Turn on the browser hook
+
+`fork/plannotator-browser` lets Zed take a Plannotator session. If no fork Zed has the session's worktree open, it opens the browser. To turn it on, set this in `~/.claude/settings.json`:
+
+```json
+"env": {
+  "PLANNOTATOR_BROWSER": "/Users/rmakowiak-n8n/workspace/zed/fork/plannotator-browser",
+  "ZED_FALLBACK_BROWSER": "Google Chrome"
+}
+```
+
+Without it, Zed still shows spec and code review sessions, but the browser also opens.
+
 ## Build setup
 
 - Rust comes from rustup in the home folder (`~/.cargo/bin`). The toolchain version is in `rust-toolchain.toml`.
 - cmake is in a private venv, linked to `~/.local/bin/cmake`.
 - Without Xcode, build with runtime shaders: `cargo build -p zed --features gpui_platform/runtime_shaders`.
 - The debug build is slow to use. For daily use, build `--profile release-fast` (optimized, no link-time optimization). The binary is `target/release-fast/zed`.
-- If Claude Code starts the fork, remove the `CLAUDE*` and `AI_AGENT` environment variables first (`env -u …`). If you do not, Claude Code in a fork terminal acts as a child session and does not save its transcript.
-- Run the fork with its own data folder: `zed --user-data-dir ~/workspace/zed-dev-data`. Its `config` folder is a copy of `~/.config/zed`, with `"feature_flags": {"diff-review": "on"}` added. The extensions and the Claude Code agent come from `~/Library/Application Support/Zed`.
+- Start the fork with `fork/run.sh [worktree]`. It removes the `CLAUDE*` and `AI_AGENT` environment variables. If Claude Code starts the fork without the script, Claude Code in a fork terminal acts as a child session and does not save its transcript.
+- The fork uses its own data folder: `--user-data-dir ~/workspace/zed-dev-data`. Its `config` folder is a copy of `~/.config/zed`, with `"feature_flags": {"diff-review": "on"}` added. The extensions and the Claude Code agent come from `~/Library/Application Support/Zed`.
 
 ## Todo
 

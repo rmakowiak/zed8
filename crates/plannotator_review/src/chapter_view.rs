@@ -34,7 +34,7 @@ use std::{
 use ui::{Color, Icon, IconName, prelude::*};
 use util::{ResultExt as _, paths::PathStyle, rel_path::RelPath};
 use workspace::{
-    Item, ItemHandle as _, ItemNavHistory, SaveIntent, ToolbarItemLocation, Workspace,
+    Item, ItemHandle as _, ItemNavHistory, ToolbarItemLocation, Workspace,
     item::{ItemEvent, SaveOptions},
     searchable::SearchableItemHandle,
 };
@@ -143,16 +143,7 @@ impl ChapterDiffView {
                 workspace.active_pane().update(cx, |pane, cx| {
                     pane.add_item(Box::new(view.clone()), true, true, None, window, cx);
                 });
-                for old in old_views {
-                    for pane in workspace.panes().to_vec() {
-                        pane.update(cx, |pane, cx| {
-                            if pane.index_for_item(&old).is_some() {
-                                pane.close_item_by_id(old.entity_id(), SaveIntent::Skip, window, cx)
-                                    .detach();
-                            }
-                        });
-                    }
-                }
+                crate::close_items(workspace, old_views, window, cx);
                 view
             })
         })
@@ -283,7 +274,7 @@ impl ChapterDiffView {
             }
         }
         let path = drafts_path(&self.key.guide_id);
-        let result = std::fs::create_dir_all(drafts_dir())
+        let result = std::fs::create_dir_all(crate::paths::drafts_dir())
             .map_err(anyhow::Error::from)
             .and_then(|()| Ok(std::fs::write(&path, serde_json::to_vec_pretty(&drafts)?)?));
         if let Err(error) = result {
@@ -378,12 +369,8 @@ fn register_file(
     });
 }
 
-fn drafts_dir() -> PathBuf {
-    util::paths::home_dir().join(".plannotator").join("zed-drafts")
-}
-
 fn drafts_path(guide_id: &str) -> PathBuf {
-    drafts_dir().join(format!("{guide_id}.json"))
+    crate::paths::drafts_dir().join(format!("{guide_id}.json"))
 }
 
 fn load_drafts(guide_id: &str) -> std::collections::BTreeMap<String, ThreadDraft> {

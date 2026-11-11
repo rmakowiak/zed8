@@ -6,11 +6,14 @@
 //! The Review panel shows the saved guide of the branch with its chapters.
 
 mod chapter_view;
+mod client;
 mod feedback;
 mod guide;
 mod input;
 mod note_thread;
 mod panel;
+mod panel_state;
+mod paths;
 mod rich_text;
 mod session;
 mod spec_doc;
@@ -18,11 +21,11 @@ mod spec_store;
 mod spec_view;
 mod start;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::Result;
 use editor::{Editor, ExportedReviewComment, actions::SendReviewToAgent};
 use git_ui::{branch_diff::BranchDiff, project_diff::ProjectDiff};
 use gpui::{App, AppContext as _, Context, Entity, Window};
-use http_client::{AsyncBody, HttpClient, Method, Request};
+use http_client::{HttpClient, Method};
 use notifications::status_toast::StatusToast;
 use std::{
     path::PathBuf,
@@ -58,16 +61,11 @@ fn send_review(
     let Some(editor) = active_diff_editor(workspace, cx) else {
         return;
     };
-    let roots: Vec<PathBuf> = workspace
-        .project()
-        .read(cx)
-        .visible_worktrees(cx)
-        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-        .collect();
+    let roots = worktree_roots(workspace, cx);
 
     // Look up the session before taking the comments, so nothing is lost
     // when no session is running.
-    let Some(session) = session::find_review_session(&session::sessions_dir(), &roots) else {
+    let Some(session) = session::find_review_session(&paths::sessions_dir(), &roots) else {
         show_toast(
             workspace,
             "No Plannotator review for this worktree. Ask Claude to start one.",
@@ -134,28 +132,46 @@ async fn post_feedback(
     worktree: &str,
 ) -> Result<()> {
     let body = feedback::build_request(comments, worktree, now_ms());
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri(format!("{session_url}/api/feedback"))
-        .header("Content-Type", "application/json")
-        .body(AsyncBody::from(serde_json::to_string(&body)?))?;
-    let response = http.send(request).await.context("Plannotator did not answer")?;
-    if !response.status().is_success() {
-        bail!("Plannotator answered {}", response.status());
-    }
-    Ok(())
+    client::send_json(&http, Method::POST, &format!("{session_url}/api/feedback"), &body).await
 }
 
 /// Keeps the comments as markdown when the send fails.
 fn save_unsent(comments: &[ExportedReviewComment], worktree: &str) -> Result<PathBuf> {
-    let dir = util::paths::home_dir()
-        .join(".plannotator")
-        .join("zed-unsent");
+    let dir = paths::unsent_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.md", now_ms()));
     let body = feedback::build_request(comments, worktree, now_ms());
     std::fs::write(&path, body.feedback)?;
     Ok(path)
+}
+
+/// Closes `items` in every pane, without a save prompt.
+pub(crate) fn close_items<T: workspace::Item>(
+    workspace: &mut Workspace,
+    items: Vec<Entity<T>>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    for item in items {
+        for pane in workspace.panes().to_vec() {
+            pane.update(cx, |pane, cx| {
+                if pane.index_for_item(&item).is_some() {
+                    pane.close_item_by_id(item.entity_id(), workspace::SaveIntent::Skip, window, cx)
+                        .detach();
+                }
+            });
+        }
+    }
+}
+
+/// The root folders of the worktrees open in this window.
+pub(crate) fn worktree_roots(workspace: &Workspace, cx: &App) -> Vec<PathBuf> {
+    workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        .collect()
 }
 
 pub(crate) fn show_toast(workspace: &mut Workspace, message: impl Into<String>, cx: &mut Context<Workspace>) {

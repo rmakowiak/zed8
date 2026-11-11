@@ -4,28 +4,29 @@
 use crate::{
     chapter_view::{ChapterDiffView, ChapterKey},
     guide::{self, LoadedGuide},
-    session::{self, Session},
+    panel_state::{PanelState, announce_roots, load_state},
+    session::Session,
     spec_view::SpecReviewView,
-    start::{self, PullRequest},
+    start,
 };
-use anyhow::Result;
 use editor::{EditorEvent, actions::SendReviewToAgent};
 use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Pixels,
     Render, Subscription, Task, WeakEntity, Window, actions, px,
 };
-use http_client::{AsyncBody, HttpClient, Method, Request};
+use http_client::{HttpClient, Method};
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use file_icons::FileIcons;
 use ui::{Checkbox, Disclosure, TintColor, ToggleState, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
-    SaveIntent, Workspace,
+    Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
@@ -38,34 +39,6 @@ actions!(
 );
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// `gh` calls GitHub, so the PR is looked up less often than local state.
-const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-
-#[derive(Clone, Default, PartialEq)]
-struct PanelState {
-    roots: Vec<PathBuf>,
-    branch: Option<String>,
-    session: Option<Session>,
-    guide: Option<LoadedGuide>,
-    /// Git status and line counts of the guide's files, by path.
-    file_stats: HashMap<String, FileStat>,
-    /// Live spec reviews (annotate sessions on markdown), oldest first.
-    specs: Vec<Session>,
-    /// The local HEAD commit.
-    head: Option<String>,
-    /// The GitHub PR of the branch, from `gh`. See `PR_REFRESH_INTERVAL`.
-    pr: Option<PullRequest>,
-    pr_checked_at: Option<Instant>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct FileStat {
-    /// The `git diff --name-status` letter: A, M, D or R.
-    status: char,
-    added: u32,
-    removed: u32,
-}
-
 pub struct ReviewPanel {
     workspace: WeakEntity<Workspace>,
     http: Arc<dyn HttpClient>,
@@ -78,6 +51,8 @@ pub struct ReviewPanel {
     expanded: HashSet<usize>,
     /// Unsent inline comments in the open chapter tab.
     comment_count: usize,
+    /// Rendered chapter overviews, by guide id and chapter.
+    overviews: HashMap<(String, usize), Entity<Markdown>>,
     _chapter_subscription: Option<Subscription>,
     _poll: Task<()>,
 }
@@ -159,6 +134,7 @@ impl ReviewPanel {
             selected: None,
             expanded: HashSet::default(),
             comment_count: 0,
+            overviews: HashMap::default(),
             _chapter_subscription: None,
             _poll: poll,
         }
@@ -167,15 +143,7 @@ impl ReviewPanel {
     fn worktree_roots(&self, cx: &App) -> Vec<PathBuf> {
         self.workspace
             .upgrade()
-            .map(|workspace| {
-                workspace
-                    .read(cx)
-                    .project()
-                    .read(cx)
-                    .visible_worktrees(cx)
-                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                    .collect()
-            })
+            .map(|workspace| crate::worktree_roots(workspace.read(cx), cx))
             .unwrap_or_default()
     }
 
@@ -200,7 +168,7 @@ impl ReviewPanel {
             match session_url {
                 Some(url) => {
                     let body = serde_json::json!({ "reviewed": reviewed });
-                    send_json(&http, Method::PUT, &format!("{url}/api/guide/saved:{id}/reviewed"), &body)
+                    crate::client::send_json(&http, Method::PUT, &format!("{url}/api/guide/saved:{id}/reviewed"), &body)
                         .await
                 }
                 None => guide::write_reviewed(&path, &reviewed),
@@ -218,7 +186,7 @@ impl ReviewPanel {
         cx.spawn_in(window, async move |_, cx| {
             let body = serde_json::json!({ "approved": true, "feedback": "", "annotations": [] });
             let result =
-                send_json(&http, Method::POST, &format!("{}/api/feedback", session.url), &body).await;
+                crate::client::send_json(&http, Method::POST, &format!("{}/api/feedback", session.url), &body).await;
             let message = match result {
                 Ok(()) => "Approved. Plannotator told Claude.".to_string(),
                 Err(error) => format!("Approve failed: {error}"),
@@ -318,16 +286,7 @@ impl ReviewPanel {
                 workspace.active_pane().update(cx, |pane, cx| {
                     pane.add_item(Box::new(view), true, focus, None, window, cx);
                 });
-                for old in finished {
-                    for pane in workspace.panes().to_vec() {
-                        pane.update(cx, |pane, cx| {
-                            if pane.index_for_item(&old).is_some() {
-                                pane.close_item_by_id(old.entity_id(), SaveIntent::Skip, window, cx)
-                                    .detach();
-                            }
-                        });
-                    }
-                }
+                crate::close_items(workspace, finished, window, cx);
             })
             .log_err();
     }
@@ -536,7 +495,12 @@ impl ReviewPanel {
             None => (Color::Muted, "No review session".to_string()),
         };
         let can_start = self.state.session.is_none() && self.state.guide.is_some();
-        Self::render_section("Sends to".to_string(), cx).child(
+        let thread = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| start::claude_thread_title(workspace.read(cx), cx));
+        Self::render_section("Sends to".to_string(), cx)
+            .child(
             h_flex()
                 .w_full()
                 .gap_1p5()
@@ -554,14 +518,34 @@ impl ReviewPanel {
                     )
                 }),
         )
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::Terminal).size(IconSize::XSmall).color(Color::Muted))
+                    .child(
+                        Label::new(match thread {
+                            Some(title) => format!("Claude thread: {title}"),
+                            None => "No Claude Code terminal open".to_string(),
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate(),
+                    ),
+            )
     }
 
-    fn render_chapters(&self, guide: &LoadedGuide, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_chapters(
+        &self,
+        guide: &LoadedGuide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let sections = &guide.envelope.guide.sections;
         let done = (0..sections.len()).filter(|ix| guide.is_reviewed(*ix)).count();
         let mut rows = Vec::with_capacity(sections.len());
         for (ix, section) in sections.iter().enumerate() {
-            rows.push(self.render_chapter(ix, section, guide.is_reviewed(ix), cx));
+            let overview = self.overviews.get(&(guide.id.clone(), ix)).cloned();
+            rows.push(self.render_chapter(ix, section, overview, guide.is_reviewed(ix), window, cx));
         }
         Self::render_section(
             format!("Chapters · {done} of {} reviewed", sections.len()),
@@ -574,9 +558,12 @@ impl ReviewPanel {
         &self,
         ix: usize,
         section: &guide::GuideSection,
+        overview: Option<Entity<Markdown>>,
         reviewed: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let overview_style = small_muted_markdown(window, cx);
         let selected = self.selected == Some(ix);
         let expanded = self.expanded.contains(&ix);
         let colors = cx.theme().colors();
@@ -667,14 +654,12 @@ impl ReviewPanel {
                 .gap_1()
                 .border_t_1()
                 .border_color(divider)
-                .when(!section.overview.is_empty(), |el| {
+                .when_some(overview, |el, overview| {
                     el.child(
                         div()
                             .pb_1()
-                            .text_sm()
-                            .line_height(px(19.))
                             .text_color(text_muted)
-                            .child(section.overview.clone()),
+                            .child(MarkdownElement::new(overview, overview_style)),
                     )
                 })
                 .children(section.diffs.iter().enumerate().map(|(file_ix, diff)| {
@@ -827,6 +812,19 @@ impl ReviewPanel {
     }
 }
 
+/// Markdown in the panel's muted text, at the overview size.
+fn small_muted_markdown(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx);
+    // The size of `text_sm`, which the overview had as plain text.
+    let size: gpui::AbsoluteLength = gpui::rems(0.875).into();
+    style.base_text_style.font_size = size;
+    style.base_text_style.line_height = gpui::relative(1.45);
+    style.container_style.text.font_size = Some(size);
+    style.container_style.text.color = Some(cx.theme().colors().text_muted);
+    style.paragraph_line_height = gpui::relative(1.45);
+    style
+}
+
 fn relative_time(saved_at_ms: u64) -> String {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -841,108 +839,21 @@ fn relative_time(saved_at_ms: u64) -> String {
     }
 }
 
-/// Tells the browser hook (`fork/plannotator-browser`) which worktrees this
-/// window has open, so Plannotator sessions there stay in Zed.
-fn announce_roots(window_key: &str, roots: &[PathBuf]) {
-    let dir = util::paths::home_dir().join(".plannotator").join("zed-windows");
-    let body = serde_json::json!({ "pid": std::process::id(), "roots": roots });
-    let result = std::fs::create_dir_all(&dir)
-        .and_then(|()| std::fs::write(dir.join(format!("{window_key}.json")), body.to_string()));
-    if let Err(error) = result {
-        log::warn!("plannotator: cannot announce worktrees: {error}");
-    }
-}
-
-fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
-    let root = roots.first().cloned();
-    let git = |args: &[&str]| -> Option<String> {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root.as_ref()?)
-            .args(args)
-            .output()
-            .ok()?;
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-    };
-    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
-    let head = git(&["rev-parse", "HEAD"]);
-    let session = session::find_review_session(&session::sessions_dir(), &roots);
-    let specs = session::find_spec_sessions(&session::sessions_dir());
-    let guide = guide::find_guide(&guide::guides_dir(), branch.as_deref(), head.as_deref());
-    let mut file_stats = HashMap::default();
-    let base = guide
-        .as_ref()
-        .and_then(|guide| guide.envelope.review.as_ref()?.base.clone())
-        .unwrap_or_else(|| "origin/master".to_string());
-    if guide.is_some()
-        && let Some(merge_base) = git(&["merge-base", "HEAD", &base])
-    {
-        for line in git(&["diff", "--name-status", &merge_base]).unwrap_or_default().lines() {
-            let mut parts = line.split('\t');
-            let (Some(status), Some(path)) = (parts.next(), parts.last()) else {
-                continue;
-            };
-            file_stats.entry(path.to_string()).or_insert(FileStat::default()).status =
-                status.chars().next().unwrap_or('M');
-        }
-        for line in git(&["diff", "--numstat", &merge_base]).unwrap_or_default().lines() {
-            let mut parts = line.split('\t');
-            let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.last())
-            else {
-                continue;
-            };
-            let stat = file_stats.entry(path.to_string()).or_insert(FileStat::default());
-            stat.added = added.parse().unwrap_or(0);
-            stat.removed = removed.parse().unwrap_or(0);
-        }
-    }
-    let pr_is_fresh = branch.is_some()
-        && branch == previous.branch
-        && head == previous.head
-        && previous
-            .pr_checked_at
-            .is_some_and(|checked| checked.elapsed() < PR_REFRESH_INTERVAL);
-    let (pr, pr_checked_at) = if pr_is_fresh {
-        (previous.pr, previous.pr_checked_at)
-    } else {
-        (root.as_deref().and_then(start::find_pull_request), Some(Instant::now()))
-    };
-    PanelState {
-        roots,
-        branch,
-        session,
-        guide,
-        file_stats,
-        specs,
-        head,
-        pr,
-        pr_checked_at,
-    }
-}
-
-pub(crate) async fn send_json(
-    http: &Arc<dyn HttpClient>,
-    method: Method,
-    url: &str,
-    body: &serde_json::Value,
-) -> Result<()> {
-    let request = Request::builder()
-        .method(method)
-        .uri(url)
-        .header("Content-Type", "application/json")
-        .body(AsyncBody::from(serde_json::to_string(body)?))?;
-    let response = http.send(request).await?;
-    anyhow::ensure!(response.status().is_success(), "Plannotator answered {}", response.status());
-    Ok(())
-}
-
 impl Render for ReviewPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(guide) = &self.state.guide {
+            for (ix, section) in guide.envelope.guide.sections.iter().enumerate() {
+                if section.overview.is_empty() {
+                    continue;
+                }
+                self.overviews.entry((guide.id.clone(), ix)).or_insert_with(|| {
+                    let source = crate::rich_text::render_mermaid(&section.overview);
+                    cx.new(|cx| Markdown::new(source.into(), None, None, cx))
+                });
+            }
+        }
         let body = match self.state.guide.clone() {
-            Some(guide) => self.render_chapters(&guide, cx).into_any_element(),
+            Some(guide) => self.render_chapters(&guide, window, cx).into_any_element(),
             None => self.render_start(cx).into_any_element(),
         };
         v_flex()

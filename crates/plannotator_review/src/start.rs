@@ -7,6 +7,8 @@ use serde::Deserialize;
 use std::{path::Path, time::Duration};
 use terminal::Terminal;
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
+use task::{RevealStrategy, SpawnInTerminal};
+use util::ResultExt as _;
 use workspace::Workspace;
 
 actions!(
@@ -77,18 +79,8 @@ fn ask_claude(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let roots: Vec<_> = workspace
-        .project()
-        .read(cx)
-        .visible_worktrees(cx)
-        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-        .collect();
-    let Some(terminal) = claude_terminal(workspace, &roots, cx) else {
-        crate::show_toast(
-            workspace,
-            "Open Claude Code in the Agent panel or in a terminal of this worktree first. Zed asks it there.",
-            cx,
-        );
+    let Some(terminal) = claude_terminal(workspace, true, cx) else {
+        start_claude(workspace, command, window, cx);
         return;
     };
     terminal.update(cx, |terminal, _| terminal.input(command.into_bytes()));
@@ -101,10 +93,43 @@ fn ask_claude(
     crate::show_toast(workspace, done_message, cx);
 }
 
+/// Starts Claude Code with `command` as its first prompt, in a new terminal
+/// of the worktree. Used when no Claude terminal is open.
+fn start_claude(
+    workspace: &mut Workspace,
+    command: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<TerminalPanel>(cx) else {
+        crate::show_toast(workspace, "Open Claude Code in a terminal of this worktree first.", cx);
+        return;
+    };
+    let task = SpawnInTerminal {
+        label: "Claude Code".to_string(),
+        full_label: format!("claude {command}"),
+        command_label: format!("claude {command}"),
+        command: Some("claude".to_string()),
+        args: vec![command],
+        cwd: crate::worktree_roots(workspace, cx).into_iter().next(),
+        use_new_terminal: true,
+        allow_concurrent_runs: true,
+        reveal: RevealStrategy::Always,
+        ..SpawnInTerminal::default()
+    };
+    let spawn = panel.update(cx, |panel, cx| panel.spawn_task(&task, window, cx));
+    cx.spawn(async move |_, _| spawn.await.log_err()).detach();
+    crate::show_toast(workspace, "Started Claude Code in a new terminal with the review request.", cx);
+}
+
 /// A terminal that runs Claude Code: the terminal thread open in the Agent
 /// panel, a terminal panel tab, or a center pane. One whose working directory
 /// is inside the worktree comes first.
-fn claude_terminal(workspace: &Workspace, roots: &[std::path::PathBuf], cx: &App) -> Option<Entity<Terminal>> {
+///
+/// With `live`, each terminal's foreground process is also read with `ps`,
+/// because Zed's cached process info can lag behind. Rendering skips that.
+fn claude_terminal(workspace: &Workspace, live: bool, cx: &App) -> Option<Entity<Terminal>> {
+    let roots = crate::worktree_roots(workspace, cx);
     let mut views: Vec<Entity<TerminalView>> = Vec::new();
     if let Some(agent_panel) = workspace.panel::<agent_ui::AgentPanel>(cx)
         && let Some(view) = agent_panel.read(cx).visible_terminal_view()
@@ -123,15 +148,14 @@ fn claude_terminal(workspace: &Workspace, roots: &[std::path::PathBuf], cx: &App
         .filter(|terminal| {
             let terminal = terminal.read(cx);
             let cached = terminal.foreground_process_command_name();
-            let live = terminal.pid().and_then(|pid| process_name(pid.as_u32()));
-            log::info!("plannotator: terminal foreground process: cached {cached:?}, live {live:?}");
+            let live = live.then(|| terminal.pid().and_then(|pid| process_name(pid.as_u32()))).flatten();
+            log::debug!("plannotator: terminal foreground process: cached {cached:?}, live {live:?}");
             [cached, live]
                 .iter()
                 .flatten()
                 .any(|name| name.contains("claude"))
         })
         .collect();
-    log::info!("plannotator: {} Claude terminals found", terminals.len());
     let in_worktree = |terminal: &Entity<Terminal>| {
         terminal
             .read(cx)
@@ -143,6 +167,20 @@ fn claude_terminal(workspace: &Workspace, roots: &[std::path::PathBuf], cx: &App
         .find(|terminal| in_worktree(terminal))
         .or(terminals.first())
         .cloned()
+}
+
+/// The title that Claude Code gives its terminal, such as the thread name.
+pub(crate) fn claude_thread_title(workspace: &Workspace, cx: &App) -> Option<String> {
+    let terminal = claude_terminal(workspace, false, cx)?;
+    let terminal = terminal.read(cx);
+    let title = if terminal.breadcrumb_text.is_empty() {
+        terminal.title(true)
+    } else {
+        terminal.breadcrumb_text.clone()
+    };
+    // Claude Code puts a spinner or a mark before its title.
+    let title = title.trim_start_matches(|c: char| !c.is_alphanumeric()).trim().to_string();
+    (!title.is_empty()).then_some(title)
 }
 
 /// The command name of a running process, read with `ps`. Zed's cached

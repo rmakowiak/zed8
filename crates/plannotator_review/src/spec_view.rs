@@ -3,20 +3,17 @@
 //! since the last round, and Approve or Send feedback.
 
 use crate::{
-    panel::send_json,
     rich_text::render_mermaid,
     session::Session,
     spec_doc::{self, Answer, Question, QuestionKind, SpecBlock, SpecComment},
     spec_store::{self, PreviousComment, SpecRecord},
 };
-use anyhow::{Context as _, Result};
 use editor::{Editor, EditorEvent};
-use futures::AsyncReadExt as _;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     IntoElement, Render, SharedString, Subscription, Task, Window, px,
 };
-use http_client::{AsyncBody, HttpClient, Method, Request};
+use http_client::{HttpClient, Method};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde::Deserialize;
 use std::{
@@ -95,12 +92,12 @@ impl SpecReviewView {
         cx: &mut Context<Self>,
     ) -> Self {
         let target = session.target.clone().unwrap_or_default();
-        let record_path = spec_store::record_path(&spec_store::drafts_dir(), &target);
+        let record_path = spec_store::record_path(&crate::paths::drafts_dir(), &target);
         let load = cx.spawn_in(window, {
             let http = http.clone();
             let url = format!("{}/api/plan", session.url);
             async move |this, cx| {
-                let result = fetch_plan(&http, &url).await;
+                let result = crate::client::get_json::<PlanResponse>(&http, &url).await;
                 this.update_in(cx, |this, window, cx| match result {
                     Ok(plan) => this.loaded(plan, window, cx),
                     Err(error) => {
@@ -338,7 +335,7 @@ impl SpecReviewView {
     ) {
         let http = self.http.clone();
         cx.spawn(async move |this, cx| {
-            let result = send_json(&http, Method::POST, &url, &body).await;
+            let result = crate::client::send_json(&http, Method::POST, &url, &body).await;
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
                     let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
@@ -708,7 +705,7 @@ impl SpecReviewView {
             .gap_2()
             .border_t_1()
             .border_color(colors.border_variant)
-            .child(div().flex_1().child(Label::new(summary).size(LabelSize::Small).color(Color::Muted)))
+            .child(div().flex_1().min_w_0().child(Label::new(summary).size(LabelSize::Small).color(Color::Muted).truncate()))
             .child(
                 Button::new("spec-approve", "Approve")
                     .style(ButtonStyle::Filled)
@@ -738,17 +735,6 @@ fn choice_icon(kind: QuestionKind, selected: bool) -> AnyElement {
         .into_any_element()
 }
 
-async fn fetch_plan(http: &Arc<dyn HttpClient>, url: &str) -> Result<PlanResponse> {
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(url)
-        .body(AsyncBody::empty())?;
-    let mut response = http.send(request).await.context("Plannotator did not answer")?;
-    anyhow::ensure!(response.status().is_success(), "Plannotator answered {}", response.status());
-    let mut body = String::new();
-    response.body_mut().read_to_string(&mut body).await?;
-    Ok(serde_json::from_str(&body)?)
-}
 
 /// The annotation records the browser UI would send. The server stores them
 /// and Claude reads only `feedback`, so they matter for Plannotator's history.

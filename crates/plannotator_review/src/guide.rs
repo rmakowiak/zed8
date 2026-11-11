@@ -103,10 +103,6 @@ impl LoadedGuide {
     }
 }
 
-pub fn guides_dir() -> PathBuf {
-    util::paths::home_dir().join(".plannotator").join("guides")
-}
-
 /// The newest saved guide made for `branch` or for the commit `head_sha`.
 pub fn find_guide(dir: &Path, branch: Option<&str>, head_sha: Option<&str>) -> Option<LoadedGuide> {
     let repo_dirs = std::fs::read_dir(dir).ok()?;
