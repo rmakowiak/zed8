@@ -2,7 +2,7 @@
 # Installs the Zed8.app that bundle.sh built, as soon as you quit Zed8.
 #
 # A Claude session inside Zed8 can start this script. It runs on after
-# Zed8 quits: it waits, swaps the app in /Applications and opens Zed8.
+# Zed8 quits: it waits, swaps the app in ~/Applications and opens Zed8.
 #
 # Usage: zed8/install.sh
 set -eu
@@ -33,19 +33,20 @@ echo "$(date): waiting for Zed8 and official Zed to quit"
 running() {
     ps -axo command= | grep -F "$1" | grep -v -e "--crash-handler" -e grep | grep -q .
 }
-while running /Applications/Zed8.app/Contents/MacOS/zed || running /Applications/Zed.app/Contents/MacOS/zed; do
+while running $HOME/Applications/Zed8.app/Contents/MacOS/zed || running /Applications/Zed.app/Contents/MacOS/zed; do
     sleep 1
 done
 
 echo "$(date): installing $new_app"
-rm -rf /Applications/Zed8.app.previous
-if [ -d /Applications/Zed8.app ]; then
+rm -rf $HOME/Applications/Zed8.app.previous
+if [ -d $HOME/Applications/Zed8.app ]; then
     # Keeps the last build, to go back with one command if the new one fails.
-    mv /Applications/Zed8.app /Applications/Zed8.app.previous
+    mv $HOME/Applications/Zed8.app $HOME/Applications/Zed8.app.previous
 fi
-cp -R "$new_app" /Applications/Zed8.app
-mkdir -p "$HOME/.local/bin"
-ln -sf /Applications/Zed8.app/Contents/MacOS/cli "$HOME/.local/bin/zed8"
+mkdir -p "$HOME/Applications"
+cp -R "$new_app" $HOME/Applications/Zed8.app
+mkdir -p "$HOME/.local/bin" "$HOME/Applications"
+ln -sf $HOME/Applications/Zed8.app/Contents/MacOS/cli "$HOME/.local/bin/zed8"
 
 echo "$(date): opening Zed8"
-open -a /Applications/Zed8.app
+open -a $HOME/Applications/Zed8.app

@@ -47,7 +47,7 @@ Zed8 is Zed plus a review panel for Plannotator, worktree groups in the threads 
 8. Build the app: `zed8/bundle.sh --no-install`. The first build in `target/zed8` takes about 20 minutes. Later builds are faster.
 9. Push: `git push origin zed8`. If SSH has no identity, the HTTPS URL above works through the `gh` credential helper.
 10. Report: the number of upstream commits, the conflicts and how you resolved them, the fixes in the crate, the test results. Say that the build is ready.
-11. Install: run `zed8/install.sh`. It waits in the background until Roman quits Zed8, swaps the app and opens Zed8 again. Tell Roman that the build is ready and that Cmd-Q installs it. This session can end when Zed8 quits. That is expected. Never quit Zed8 yourself. The old build stays at `/Applications/Zed8.app.previous`.
+11. Install: run `zed8/install.sh`. It waits in the background until Roman quits Zed8, swaps the app and opens Zed8 again. Tell Roman that the build is ready and that Cmd-Q installs it. This session can end when Zed8 quits. That is expected. Never quit Zed8 yourself. The old build stays at `~/Applications/Zed8.app.previous`.
 
 ## When the merge goes wrong
 
