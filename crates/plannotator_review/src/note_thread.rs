@@ -211,12 +211,16 @@ impl Render for NoteThread {
                 .color(Color::Muted),
             )
             .child(
-                Label::new("✦ Claude")
+                Label::new("✦ Claude note")
                     .size(LabelSize::Small)
                     .weight(FontWeight::SEMIBOLD)
                     .color(Color::Accent),
             )
-            .child(Label::new(self.lines.clone()).size(LabelSize::Small).color(Color::Muted))
+            .when(!collapsed, |header| {
+                header
+                    .child(div().flex_1())
+                    .child(Label::new(self.lines.clone()).size(LabelSize::XSmall).color(Color::Muted))
+            })
             .when(collapsed, |header| {
                 header
                     .child(
@@ -228,6 +232,7 @@ impl Render for NoteThread {
                             .text_color(text_muted)
                             .child(self.text.clone()),
                     )
+                    .child(Label::new(self.lines.clone()).size(LabelSize::XSmall).color(Color::Muted))
                     .when(reply_count > 0, |header| {
                         header.child(
                             Label::new(format!("{reply_count} replies"))
@@ -248,14 +253,14 @@ impl Render for NoteThread {
             .max_w(px(820.))
             .flex_1()
             .my_1()
-            .pl_3()
-            .pr_3()
+            .px_3()
             .py_2()
             .gap_1()
-            .rounded_r_md()
-            .border_l_4()
-            .border_color(accent)
-            .bg(accent.opacity(0.08))
+            .rounded_md()
+            .border_1()
+            .border_color(accent.opacity(0.35))
+            .bg(accent.opacity(0.06))
+            .shadow_xs()
             .child(header)
             .when(!collapsed, |thread| {
                 thread

@@ -18,9 +18,10 @@ use editor::{
 };
 use git_ui_core::file_diff_view::build_buffer_diff;
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
-    IntoElement, Render, SharedString, Subscription, Task, Window,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font, FontWeight,
+    IntoElement, Render, SharedString, Subscription, Task, Window, px,
 };
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use language::{Buffer, Capability, HighlightedText, OffsetRangeExt, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{Project, ProjectPath};
@@ -46,10 +47,30 @@ pub struct ChapterKey {
     pub chapter: usize,
 }
 
+/// The chapter card above the diff: its place in the guide and its overview.
+#[derive(Clone)]
+pub struct ChapterIntro {
+    pub index: usize,
+    pub count: usize,
+    pub title: String,
+    /// Markdown from the guide. Mermaid blocks are drawn as text.
+    pub overview: String,
+    pub reviewed: bool,
+}
+
+/// What the buttons under the diff ask the Review panel to do.
+pub enum ChapterNavEvent {
+    Show(usize),
+    ToggleReviewed(usize),
+}
+
 pub struct ChapterDiffView {
     editor: Entity<SplittableEditor>,
     key: ChapterKey,
     title: SharedString,
+    intro: ChapterIntro,
+    overview: Option<Entity<Markdown>>,
+    overview_open: bool,
     path_keys: Vec<(String, PathKey)>,
     /// Inline comments in the editor, without the replies to notes.
     editor_comment_count: usize,
@@ -63,6 +84,7 @@ impl ChapterDiffView {
     pub fn open(
         key: ChapterKey,
         title: String,
+        intro: ChapterIntro,
         root: PathBuf,
         base: String,
         diffs: Vec<GuideDiff>,
@@ -126,6 +148,7 @@ impl ChapterDiffView {
                     Self::new(
                         key,
                         title.into(),
+                        intro,
                         multibuffer,
                         project.clone(),
                         path_keys,
@@ -152,6 +175,7 @@ impl ChapterDiffView {
     fn new(
         key: ChapterKey,
         title: SharedString,
+        intro: ChapterIntro,
         multibuffer: Entity<MultiBuffer>,
         project: Entity<Project>,
         path_keys: Vec<(String, PathKey)>,
@@ -190,10 +214,17 @@ impl ChapterDiffView {
             }),
         ];
 
+        let overview = (!intro.overview.trim().is_empty()).then(|| {
+            let source = crate::rich_text::render_mermaid(&intro.overview);
+            cx.new(|cx| Markdown::new(source.into(), None, None, cx))
+        });
         Self {
             editor,
             key,
             title,
+            intro,
+            overview,
+            overview_open: true,
             path_keys,
             editor_comment_count: 0,
             note_threads: Vec::new(),
@@ -292,6 +323,128 @@ impl ChapterDiffView {
             .collect();
         self.emit_comment_count(cx);
         replies
+    }
+
+    pub fn set_reviewed(&mut self, reviewed: bool, cx: &mut Context<Self>) {
+        if self.intro.reviewed != reviewed {
+            self.intro.reviewed = reviewed;
+            cx.notify();
+        }
+    }
+
+    fn render_intro(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        style.container_style.text.color = Some(colors.text_muted);
+        let open = self.overview_open;
+        v_flex()
+            .mx_3()
+            .mt_2()
+            .mb_1()
+            .px_3()
+            .py_2()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.surface_background)
+            .child(
+                h_flex()
+                    .id("chapter-intro-header")
+                    .w_full()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.overview_open = !this.overview_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                Label::new(format!(
+                                    "CHAPTER {} OF {}",
+                                    self.intro.index + 1,
+                                    self.intro.count
+                                ))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(self.intro.title.clone())
+                                    .size(LabelSize::Large)
+                                    .weight(FontWeight::SEMIBOLD),
+                            ),
+                    )
+                    .when(self.intro.reviewed, |row| {
+                        row.child(
+                            h_flex()
+                                .gap_1()
+                                .child(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Success))
+                                .child(Label::new("Reviewed").size(LabelSize::Small).color(Color::Success)),
+                        )
+                    })
+                    .when(self.overview.is_some(), |row| {
+                        row.child(
+                            Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+            .when_some(self.overview.clone().filter(|_| open), |card, overview| {
+                card.child(
+                    div()
+                        .id("chapter-overview")
+                        .max_h(px(260.))
+                        .overflow_y_scroll()
+                        .child(MarkdownElement::new(overview, style)),
+                )
+            })
+    }
+
+    fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ix = self.intro.index;
+        let last = ix + 1 >= self.intro.count;
+        h_flex()
+            .w_full()
+            .px_3()
+            .py_1p5()
+            .gap_2()
+            .justify_between()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Button::new("chapter-previous", "Previous chapter")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::ArrowLeft).size(IconSize::XSmall))
+                    .disabled(ix == 0)
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(ChapterNavEvent::Show(ix - 1)))),
+            )
+            .child(
+                Button::new(
+                    "chapter-reviewed",
+                    if self.intro.reviewed { "Reviewed" } else { "Mark chapter reviewed" },
+                )
+                .style(if self.intro.reviewed {
+                    ButtonStyle::Tinted(ui::TintColor::Success)
+                } else {
+                    ButtonStyle::Filled
+                })
+                .label_size(LabelSize::Small)
+                .start_icon(Icon::new(IconName::Check).size(IconSize::XSmall))
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(ChapterNavEvent::ToggleReviewed(ix)))),
+            )
+            .child(
+                Button::new("chapter-next", "Next chapter")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .end_icon(Icon::new(IconName::ArrowRight).size(IconSize::XSmall))
+                    .disabled(last)
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(ChapterNavEvent::Show(ix + 1)))),
+            )
     }
 
     pub fn key(&self) -> &ChapterKey {
@@ -452,6 +605,7 @@ fn old_texts(root: &Path, base: &str, files: &[String]) -> Result<Vec<String>> {
 }
 
 impl EventEmitter<EditorEvent> for ChapterDiffView {}
+impl EventEmitter<ChapterNavEvent> for ChapterDiffView {}
 
 impl Focusable for ChapterDiffView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -563,7 +717,12 @@ impl Item for ChapterDiffView {
 }
 
 impl Render for ChapterDiffView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        self.editor.clone()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .bg(cx.theme().colors().editor_background)
+            .child(self.render_intro(window, cx))
+            .child(div().flex_1().min_h_0().child(self.editor.clone()))
+            .child(self.render_nav(cx))
     }
 }

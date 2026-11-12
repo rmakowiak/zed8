@@ -508,6 +508,8 @@ struct SidebarContents {
     /// Worktree headings, by the index of the first entry under each. A
     /// project group gets them when its threads run in more than one worktree.
     worktree_headings: HashMap<usize, WorktreeHeading>,
+    /// Rows under a worktree heading. They skip their own worktree chip.
+    grouped_rows: HashSet<usize>,
     has_open_projects: bool,
 }
 
@@ -516,6 +518,8 @@ struct WorktreeHeading {
     name: SharedString,
     branch: Option<SharedString>,
     full_path: SharedString,
+    /// The number of threads under the heading.
+    count: usize,
 }
 
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
@@ -1450,6 +1454,7 @@ impl Sidebar {
         let mut current_terminal_ids: HashSet<TerminalId> = HashSet::new();
         let mut project_header_indices: Vec<usize> = Vec::new();
         let mut worktree_headings: HashMap<usize, WorktreeHeading> = HashMap::new();
+        let mut grouped_rows: HashSet<usize> = HashSet::new();
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut seen_terminal_ids: HashSet<TerminalId> = HashSet::new();
 
@@ -1984,6 +1989,7 @@ impl Sidebar {
                     &mut current_session_ids,
                     &mut current_thread_ids,
                     &mut worktree_headings,
+                    &mut grouped_rows,
                 );
             } else {
                 let has_terminal_notifications = terminals
@@ -2035,6 +2041,7 @@ impl Sidebar {
                     &mut current_session_ids,
                     &mut current_thread_ids,
                     &mut worktree_headings,
+                    &mut grouped_rows,
                 );
             }
         }
@@ -2054,6 +2061,7 @@ impl Sidebar {
             notified_terminals,
             project_header_indices,
             worktree_headings,
+            grouped_rows,
             has_open_projects,
         };
     }
@@ -2312,10 +2320,21 @@ impl Sidebar {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
         };
+        // Rows of a worktree group hang from a guide line under the heading.
+        let rendered = if self.contents.grouped_rows.contains(&ix) {
+            let line = cx.theme().colors().border_variant;
+            div()
+                .w_full()
+                .pl(px(14.))
+                .child(div().w_full().border_l_1().border_color(line).child(rendered))
+                .into_any_element()
+        } else {
+            rendered
+        };
         let rendered = match self.contents.worktree_headings.get(&ix) {
             Some(heading) => v_flex()
                 .w_full()
-                .child(Self::render_worktree_heading(ix, heading))
+                .child(Self::render_worktree_heading(ix, heading, cx))
                 .child(rendered)
                 .into_any_element(),
             None => rendered,
@@ -2333,37 +2352,73 @@ impl Sidebar {
         }
     }
 
-    /// A small label above the threads of one worktree: its name, then its
-    /// branch.
-    fn render_worktree_heading(ix: usize, heading: &WorktreeHeading) -> AnyElement {
+    /// The heading above the threads of one worktree: an icon tile, the
+    /// worktree name, its branch and the thread count.
+    fn render_worktree_heading(ix: usize, heading: &WorktreeHeading, cx: &App) -> AnyElement {
+        let colors = cx.theme().colors();
         h_flex()
             .id(("worktree-heading", ix))
             .w_full()
             .min_w_0()
-            .pl_3()
+            .pl_2()
             .pr_2()
-            .pt_1p5()
-            .pb_0p5()
-            .gap_1()
+            .pt_2()
+            .pb_1()
+            .gap_1p5()
             .child(
-                Icon::new(IconName::GitWorktree)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
+                div()
+                    .flex_none()
+                    .size(px(18.))
+                    .rounded_sm()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(colors.element_background)
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .child(
+                        Icon::new(IconName::GitWorktree)
+                            .size(IconSize::XSmall)
+                            .color(Color::Accent),
+                    ),
             )
             .child(
                 Label::new(heading.name.clone())
-                    .size(LabelSize::XSmall)
-                    .weight(gpui::FontWeight::SEMIBOLD)
-                    .color(Color::Muted),
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::SEMIBOLD),
             )
-            .when_some(heading.branch.clone(), |row, branch| {
-                row.child(
-                    Label::new(branch)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Placeholder)
-                        .truncate(),
-                )
-            })
+            .child(
+                div().flex_1().min_w_0().when_some(heading.branch.clone(), |el, branch| {
+                    el.child(
+                        h_flex()
+                            .gap_0p5()
+                            .min_w_0()
+                            .child(
+                                Icon::new(IconName::GitBranch)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(branch)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    )
+                }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .px_1p5()
+                    .rounded_full()
+                    .bg(colors.element_background)
+                    .child(
+                        Label::new(heading.count.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
             .tooltip(Tooltip::text(heading.full_path.clone()))
             .into_any_element()
     }
@@ -5901,6 +5956,7 @@ impl Sidebar {
         current_session_ids: &mut HashSet<acp::SessionId>,
         current_thread_ids: &mut HashSet<agent_ui::ThreadId>,
         worktree_headings: &mut HashMap<usize, WorktreeHeading>,
+        grouped_rows: &mut HashSet<usize>,
     ) {
         fn display_time(entry: &ListEntry) -> DateTime<Utc> {
             match entry {
@@ -5928,6 +5984,7 @@ impl Sidebar {
                     .unwrap_or_else(|| "No worktree".into()),
                 branch: join(&|worktree| worktree.branch_name.clone()),
                 full_path: join(&|worktree| Some(worktree.full_path.clone())).unwrap_or_default(),
+                count: 0,
             }
         }
 
@@ -5953,11 +6010,15 @@ impl Sidebar {
         }
         let show_headings = groups.len() > 1;
 
-        for (heading, rows) in groups {
+        for (mut heading, rows) in groups {
             if show_headings {
+                heading.count = rows.len();
                 worktree_headings.insert(entries.len(), heading);
             }
             for entry in rows {
+                if show_headings {
+                    grouped_rows.insert(entries.len());
+                }
                 if let ListEntry::Thread(thread) = &entry {
                     if let Some(session_id) = &thread.metadata.session_id {
                         current_session_ids.insert(session_id.clone());
@@ -6396,10 +6457,15 @@ impl Sidebar {
 
         let is_remote = thread.workspace.is_remote(cx);
 
-        let worktrees = apply_worktree_label_mode(
-            thread.worktrees.clone(),
-            cx.flag_value::<AgentThreadWorktreeLabelFlag>(),
-        );
+        // Under a worktree heading, the chip repeats the heading.
+        let worktrees = if self.contents.grouped_rows.contains(&ix) {
+            Vec::new()
+        } else {
+            apply_worktree_label_mode(
+                thread.worktrees.clone(),
+                cx.flag_value::<AgentThreadWorktreeLabelFlag>(),
+            )
+        };
 
         let (icon, icon_svg) = if is_draft {
             (IconName::Circle, None)
@@ -6725,10 +6791,14 @@ impl Sidebar {
         let metadata = terminal.metadata.clone();
         let workspace = terminal.workspace.clone();
         let focus_handle = self.focus_handle.clone();
-        let worktrees = apply_worktree_label_mode(
-            terminal.worktrees.clone(),
-            cx.flag_value::<AgentThreadWorktreeLabelFlag>(),
-        );
+        let worktrees = if self.contents.grouped_rows.contains(&ix) {
+            Vec::new()
+        } else {
+            apply_worktree_label_mode(
+                terminal.worktrees.clone(),
+                cx.flag_value::<AgentThreadWorktreeLabelFlag>(),
+            )
+        };
         let is_remote = terminal.workspace.is_remote(cx);
         let is_renaming =
             self.rename_target == Some(RenameTarget::Terminal(terminal.metadata.terminal_id));

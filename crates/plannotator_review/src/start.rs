@@ -83,7 +83,7 @@ fn ask_claude(
     cx: &mut Context<Workspace>,
 ) {
     let Some(target) = target_terminal(workspace, true, cx) else {
-        start_claude(workspace, command, window, cx);
+        start_claude(workspace, Some(command), window, cx);
         return;
     };
     let terminal = target.terminal.clone();
@@ -97,11 +97,11 @@ fn ask_claude(
     crate::show_toast(workspace, format!("{done_message} Thread: {}.", target.title), cx);
 }
 
-/// Starts Claude Code with `command` as its first prompt, in a new terminal
-/// of the worktree. Used when no Claude terminal is open.
-fn start_claude(
+/// Starts Claude Code in a new terminal of the worktree, with `command` as
+/// its first prompt if there is one.
+pub(crate) fn start_claude(
     workspace: &mut Workspace,
-    command: String,
+    command: Option<String>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -109,12 +109,16 @@ fn start_claude(
         crate::show_toast(workspace, "Open Claude Code in a terminal of this worktree first.", cx);
         return;
     };
+    let full_label = match &command {
+        Some(command) => format!("claude {command}"),
+        None => "claude".to_string(),
+    };
     let task = SpawnInTerminal {
         label: "Claude Code".to_string(),
-        full_label: format!("claude {command}"),
-        command_label: format!("claude {command}"),
+        full_label: full_label.clone(),
+        command_label: full_label,
         command: Some("claude".to_string()),
-        args: vec![command],
+        args: command.into_iter().collect(),
         cwd: crate::worktree_roots(workspace, cx).into_iter().next(),
         use_new_terminal: true,
         allow_concurrent_runs: true,
@@ -123,7 +127,7 @@ fn start_claude(
     };
     let spawn = panel.update(cx, |panel, cx| panel.spawn_task(&task, window, cx));
     cx.spawn(async move |_, _| spawn.await.log_err()).detach();
-    crate::show_toast(workspace, "Started Claude Code in a new terminal with the review request.", cx);
+    crate::show_toast(workspace, "Started Claude Code in a new terminal.", cx);
 }
 
 /// A terminal that runs Claude Code.

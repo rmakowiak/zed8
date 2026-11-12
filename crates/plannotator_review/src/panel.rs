@@ -2,7 +2,7 @@
 //! reviewed ticks, the Plannotator session status, Approve and Send feedback.
 
 use crate::{
-    chapter_view::{ChapterDiffView, ChapterKey},
+    chapter_view::{ChapterDiffView, ChapterIntro, ChapterKey, ChapterNavEvent},
     guide::{self, LoadedGuide},
     panel_state::{PanelState, announce_roots, load_state},
     session::Session,
@@ -23,7 +23,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use file_icons::FileIcons;
-use ui::{Checkbox, Disclosure, SpinnerLabel, TintColor, ToggleState, Tooltip, prelude::*};
+use ui::{
+    Checkbox, ContextMenu, Disclosure, IconPosition, PopoverMenu, SpinnerLabel, TintColor, ToggleState,
+    Tooltip, prelude::*,
+};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
@@ -80,7 +83,7 @@ pub struct ReviewPanel {
     _spec_subscriptions: Vec<Subscription>,
     /// Rendered chapter overviews, by guide id and chapter.
     overviews: HashMap<(String, usize), Entity<Markdown>>,
-    _chapter_subscription: Option<Subscription>,
+    _chapter_subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
 
@@ -166,7 +169,7 @@ impl ReviewPanel {
             chosen_session: None,
             chosen_thread: None,
             _spec_subscriptions: Vec::new(),
-            _chapter_subscription: None,
+            _chapter_subscriptions: Vec::new(),
             _poll: poll,
         }
     }
@@ -187,8 +190,23 @@ impl ReviewPanel {
             return;
         };
         *flag = !*flag;
+        let now_reviewed = *flag;
         guide.envelope.reviewed = reviewed.clone();
+        let guide_id = guide.id.clone();
         cx.notify();
+        if let Some(workspace) = self.workspace.upgrade() {
+            let views: Vec<Entity<ChapterDiffView>> = workspace
+                .read(cx)
+                .items_of_type::<ChapterDiffView>(cx)
+                .filter(|view| {
+                    let key = view.read(cx).key();
+                    key.guide_id == guide_id && key.chapter == chapter
+                })
+                .collect();
+            for view in views {
+                view.update(cx, |view, cx| view.set_reviewed(now_reviewed, cx));
+            }
+        }
 
         let path = guide.path.clone();
         let id = guide.id.clone();
@@ -255,6 +273,13 @@ impl ReviewPanel {
             chapter,
         };
         let title = format!("{}. {}", chapter + 1, section.title);
+        let intro = ChapterIntro {
+            index: chapter,
+            count: guide.envelope.guide.sections.len(),
+            title: section.title.clone(),
+            overview: section.overview.clone(),
+            reviewed: guide.is_reviewed(chapter),
+        };
         let diffs = section.diffs.clone();
         let base = guide
             .envelope
@@ -279,10 +304,10 @@ impl ReviewPanel {
                     }
                     return Some(view);
                 }
-                let open = ChapterDiffView::open(key, title, root, base, diffs, workspace, window, cx);
+                let open = ChapterDiffView::open(key, title, intro, root, base, diffs, workspace, window, cx);
                 cx.spawn_in(window, async move |_, cx| {
                     let view = open.await?;
-                    panel.update(cx, |panel, cx| panel.watch_chapter(&view, cx))?;
+                    panel.update_in(cx, |panel, window, cx| panel.watch_chapter(&view, window, cx))?;
                     if let Some(file) = file {
                         view.update_in(cx, |view, window, cx| view.scroll_to_file(&file, window, cx))?;
                     }
@@ -295,7 +320,7 @@ impl ReviewPanel {
             .flatten();
         // Outside the workspace update: this panel is already being updated here.
         if let Some(view) = reused {
-            self.watch_chapter(&view, cx);
+            self.watch_chapter(&view, window, cx);
         }
     }
 
@@ -533,15 +558,22 @@ impl ReviewPanel {
         )
     }
 
-    /// Keeps the Send feedback count in step with the open chapter tab.
-    fn watch_chapter(&mut self, view: &Entity<ChapterDiffView>, cx: &mut Context<Self>) {
+    /// Keeps the Send feedback count in step with the open chapter tab, and
+    /// follows its Previous, Next and Mark reviewed buttons.
+    fn watch_chapter(&mut self, view: &Entity<ChapterDiffView>, window: &mut Window, cx: &mut Context<Self>) {
         self.comment_count = view.read(cx).review_comment_count(cx);
-        self._chapter_subscription = Some(cx.subscribe(view, |this, _, event: &EditorEvent, cx| {
-            if let EditorEvent::ReviewCommentsChanged { total_count } = event {
-                this.comment_count = *total_count;
-                cx.notify();
-            }
-        }));
+        self._chapter_subscriptions = vec![
+            cx.subscribe(view, |this, _, event: &EditorEvent, cx| {
+                if let EditorEvent::ReviewCommentsChanged { total_count } = event {
+                    this.comment_count = *total_count;
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(view, window, |this, _, event: &ChapterNavEvent, window, cx| match event {
+                ChapterNavEvent::Show(chapter) => this.show_chapter(*chapter, None, window, cx),
+                ChapterNavEvent::ToggleReviewed(chapter) => this.toggle_reviewed(*chapter, cx),
+            }),
+        ];
         cx.notify();
     }
 
@@ -575,8 +607,13 @@ impl ReviewPanel {
                     .as_ref()
                     .and_then(|review| review.base.clone())
                     .unwrap_or_else(|| "origin/master".to_string());
+                // The PR number and title read best, as in the mock.
+                let title = match &self.state.pr {
+                    Some(pr) => format!("#{} {}", pr.number, pr.title),
+                    None => guide.envelope.guide.title.clone(),
+                };
                 (
-                    guide.envelope.guide.title.clone(),
+                    title,
                     format!(
                         "Guide by {engine} · {} · base {base}",
                         relative_time(guide.envelope.saved_at)
@@ -611,12 +648,15 @@ impl ReviewPanel {
                     }),
             )
             .child(Label::new(meta).size(LabelSize::Small).color(Color::Muted))
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall).color(Color::Muted))
-                    .child(Label::new(branch).size(LabelSize::Small).color(Color::Muted)),
-            )
+            // The title bar shows the branch. Without a guide, it helps here.
+            .when(self.state.guide.is_none() && !branch.is_empty(), |header| {
+                header.child(
+                    h_flex()
+                        .gap_1()
+                        .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall).color(Color::Muted))
+                        .child(Label::new(branch).size(LabelSize::Small).color(Color::Muted)),
+                )
+            })
             .when_some(self.head_mismatch(), |header, pr_head| {
                 header.child(
                     h_flex()
@@ -676,175 +716,175 @@ impl ReviewPanel {
         let terminals = self.claude_terminals(cx);
         let session = self.session().cloned();
         let target = start::pick_terminal(&terminals, session.as_ref(), self.chosen_thread).cloned();
-        let busy = target.as_ref().is_some_and(|target| target.busy);
-        let code_sent = self.code_sent.clone().filter(|_| session.is_none());
-        let can_start = session.is_none() && self.state.guide.is_some() && code_sent.is_none();
-        let status: AnyElement = match &code_sent {
-            Some(sent) if sent.approved => h_flex()
-                .gap_1p5()
-                .child(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Success))
-                .child(Label::new(sent.message.clone()).size(LabelSize::Small).color(Color::Success))
-                .into_any_element(),
-            Some(sent) => h_flex()
-                .gap_1p5()
-                .child(if busy {
-                    SpinnerLabel::new().size(LabelSize::Small).color(Color::Accent).into_any_element()
-                } else {
-                    Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent).into_any_element()
-                })
-                .child(
-                    Label::new(if busy {
-                        format!("{}. Claude is working on it.", sent.message)
-                    } else {
-                        format!("{}. Claude has it.", sent.message)
-                    })
-                    .size(LabelSize::Small)
-                    .color(Color::Accent),
-                )
-                .into_any_element(),
-            None => match &session {
-                Some(session) => h_flex()
-                    .gap_1p5()
-                    .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(Color::Success))
-                    .child(
-                        Label::new(format!("Claude, through Plannotator ({})", session.port()))
-                            .size(LabelSize::Small),
-                    )
-                    .into_any_element(),
-                None => h_flex()
-                    .gap_1p5()
-                    .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(Color::Muted))
-                    .child(Label::new("No review session").size(LabelSize::Small))
-                    .into_any_element(),
-            },
-        };
-        let mut section = Self::render_section("Sends to".to_string(), cx).child(
-            h_flex()
-                .w_full()
-                .gap_1p5()
-                .child(div().flex_1().min_w_0().child(status))
-                .when(can_start, |row| {
-                    row.child(
-                        Button::new("start-session", "Start session")
-                            .style(ButtonStyle::Tinted(TintColor::Accent))
-                            .label_size(LabelSize::Small)
-                            .tooltip(Tooltip::text("Ask Claude to start a review session for this guide"))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(start::StartSession), cx)
-                            }),
-                    )
-                }),
-        );
-
-        // Several sessions: one row each, and you pick which one gets the feedback.
-        if self.state.sessions.len() > 1 {
-            let chosen = session.as_ref().map(|session| session.pid);
-            let rows: Vec<AnyElement> = self
-                .state
-                .sessions
-                .iter()
-                .map(|candidate| {
-                    let pid = candidate.pid;
-                    let owner = terminals.iter().find(|terminal| terminal.owns(candidate));
-                    let selected = chosen == Some(pid);
-                    v_flex()
-                        .w_full()
-                        .child(
-                            h_flex()
-                                .id(("session", pid as usize))
-                                .w_full()
-                                .gap_1p5()
-                                .cursor_pointer()
-                                .child(
-                                    crate::spec_view::control(crate::spec_doc::QuestionKind::Single, selected, false, cx.theme().colors()),
-                                )
-                                .child(
-                                    Label::new(format!(
-                                        "Session {} · started {}",
-                                        candidate.port(),
-                                        candidate.started_label()
-                                    ))
-                                    .size(LabelSize::Small)
-                                    .color(if selected { Color::Default } else { Color::Muted }),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.chosen_session = Some(pid);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(div().pl_5().child(Self::render_thread_label(
-                            ("session-thread", pid as usize),
-                            owner,
-                            cx,
-                        )))
-                        .into_any_element()
-                })
-                .collect();
-            return section
-                .child(
-                    Label::new("Several Claude threads review this worktree. Pick one:")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(v_flex().gap_1().children(rows));
-        }
-
-        // No session and several Claude threads: pick the one that gets "Review PR".
-        if session.is_none() && terminals.len() > 1 {
-            let chosen = target.as_ref().map(|target| target.id());
-            let rows: Vec<AnyElement> = terminals
-                .iter()
-                .enumerate()
-                .map(|(ix, terminal)| {
-                    let id = terminal.id();
-                    let selected = chosen == Some(id);
-                    h_flex()
-                        .id(("thread-choice", ix))
-                        .w_full()
-                        .gap_1p5()
-                        .cursor_pointer()
-                        .child(
-                            crate::spec_view::control(crate::spec_doc::QuestionKind::Single, selected, false, cx.theme().colors()),
-                        )
-                        .child(
-                            div().flex_1().min_w_0().child(
-                                Label::new(terminal.title.clone())
-                                    .size(LabelSize::Small)
-                                    .color(if selected { Color::Default } else { Color::Muted })
-                                    .truncate(),
-                            ),
-                        )
-                        .when(terminal.busy, |row| {
-                            row.child(Label::new("working").size(LabelSize::XSmall).color(Color::Accent))
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.chosen_thread = Some(id);
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                })
-                .collect();
-            return section
-                .child(
-                    Label::new("Claude thread for Review PR and Start session:")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .child(v_flex().gap_1().children(rows));
-        }
-
-        let owner = match &session {
+        // With a session, the chip names the thread that started it.
+        let chip_thread = match &session {
             Some(session) => terminals.iter().find(|terminal| terminal.owns(session)).cloned(),
             None => target.clone(),
         };
-        section = section.child(match (&session, &owner) {
-            (Some(_), _) | (None, Some(_)) => Self::render_thread_label("session-thread", owner.as_ref(), cx),
-            (None, None) => Label::new("No Claude Code terminal open")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element(),
-        });
-        section
+        let busy = chip_thread.as_ref().is_some_and(|thread| thread.busy);
+        let code_sent = self.code_sent.clone().filter(|_| session.is_none());
+        let can_start = session.is_none() && self.state.guide.is_some() && code_sent.is_none();
+
+        let (status_color, status): (Color, String) = match (&code_sent, &session) {
+            (Some(sent), _) if sent.approved => (Color::Success, sent.message.clone()),
+            (Some(sent), _) if busy => (Color::Accent, format!("{}. Claude is working on it.", sent.message)),
+            (Some(sent), _) => (Color::Accent, format!("{}. Claude has it.", sent.message)),
+            (None, Some(session)) => {
+                let others = self.state.sessions.len().saturating_sub(1);
+                let mut text = format!("Plannotator session {} · Claude waits for you", session.port());
+                if others > 0 {
+                    text.push_str(&format!(" · {others} more"));
+                }
+                (Color::Success, text)
+            }
+            (None, None) => (Color::Muted, "No review session".to_string()),
+        };
+
+        let chip_label = match (&chip_thread, &session) {
+            (Some(thread), _) => thread.title.clone(),
+            (None, Some(_)) => "Thread not open in this window".to_string(),
+            (None, None) => "No Claude thread".to_string(),
+        };
+        let menu = self.thread_menu(&terminals, session.as_ref(), target.as_ref(), cx);
+        let chip = PopoverMenu::new("claude-thread-picker")
+            .menu(move |window, cx| Some(menu(window, cx)))
+            .trigger_with_tooltip(
+                Button::new("claude-thread-chip", chip_label)
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .truncate(true)
+                    .start_icon(
+                        Icon::new(if busy { IconName::LoadCircle } else { IconName::Terminal })
+                            .size(IconSize::XSmall)
+                            .color(if busy { Color::Accent } else { Color::Muted }),
+                    )
+                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted)),
+                Tooltip::text("The Claude thread that gets your review"),
+            );
+
+        Self::render_section("Sends to".to_string(), cx)
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .child(div().flex_1().min_w_0().child(chip))
+                    .when(can_start, |row| {
+                        row.child(
+                            Button::new("start-session", "Start session")
+                                .style(ButtonStyle::Tinted(TintColor::Accent))
+                                .label_size(LabelSize::Small)
+                                .tooltip(Tooltip::text("Ask Claude to start a review session for this guide"))
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(start::StartSession), cx)
+                                }),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(if busy && code_sent.is_some() {
+                        SpinnerLabel::new().size(LabelSize::XSmall).color(Color::Accent).into_any_element()
+                    } else {
+                        Icon::new(IconName::Circle).size(IconSize::XSmall).color(status_color).into_any_element()
+                    })
+                    .child(
+                        Label::new(status)
+                            .size(LabelSize::XSmall)
+                            .color(if status_color == Color::Muted { Color::Muted } else { status_color })
+                            .truncate(),
+                    ),
+            )
+    }
+
+    /// The menu behind the thread chip. With review sessions, each entry is
+    /// a session and its thread. Without one, each entry is a Claude thread.
+    fn thread_menu(
+        &self,
+        terminals: &[start::ClaudeTerminal],
+        session: Option<&Session>,
+        target: Option<&start::ClaudeTerminal>,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&mut Window, &mut App) -> Entity<ContextMenu> + 'static {
+        let panel = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        let sessions: Vec<(i32, String, bool)> = self
+            .state
+            .sessions
+            .iter()
+            .map(|candidate| {
+                let owner = terminals.iter().find(|terminal| terminal.owns(candidate));
+                let label = format!(
+                    "{} · session {}, {}",
+                    owner.map(|owner| owner.title.as_str()).unwrap_or("Thread not open here"),
+                    candidate.port(),
+                    candidate.started_label()
+                );
+                (candidate.pid, label, session.is_some_and(|session| session.pid == candidate.pid))
+            })
+            .collect();
+        let threads: Vec<(start::ClaudeTerminal, bool)> = terminals
+            .iter()
+            .map(|terminal| (terminal.clone(), target.is_some_and(|target| target.id() == terminal.id())))
+            .collect();
+        let open = session
+            .and_then(|session| terminals.iter().find(|terminal| terminal.owns(session)))
+            .or(target)
+            .cloned();
+        move |window, cx| {
+            let (panel, workspace, sessions, threads, open) =
+                (panel.clone(), workspace.clone(), sessions.clone(), threads.clone(), open.clone());
+            ContextMenu::build(window, cx, move |mut menu, _, _| {
+                if !sessions.is_empty() {
+                    menu = menu.header("Review sessions in this worktree");
+                    for (pid, label, chosen) in sessions {
+                        let panel = panel.clone();
+                        menu = menu.toggleable_entry(label, chosen, IconPosition::Start, None, move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.chosen_session = Some(pid);
+                                    cx.notify();
+                                })
+                                .ok();
+                        });
+                    }
+                } else if !threads.is_empty() {
+                    menu = menu.header("Claude threads");
+                    for (thread, chosen) in threads {
+                        let panel = panel.clone();
+                        let id = thread.id();
+                        let label = if thread.busy {
+                            format!("{} · working", thread.title)
+                        } else {
+                            thread.title.clone()
+                        };
+                        menu = menu.toggleable_entry(label, chosen, IconPosition::Start, None, move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.chosen_thread = Some(id);
+                                    cx.notify();
+                                })
+                                .ok();
+                        });
+                    }
+                }
+                menu = menu.separator();
+                if let Some(open) = open {
+                    let workspace = workspace.clone();
+                    menu = menu.entry("Open this thread", None, move |window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| start::open_terminal(workspace, &open, window, cx))
+                            .ok();
+                    });
+                }
+                let workspace = workspace.clone();
+                menu.entry("New Claude thread", None, move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| start::start_claude(workspace, None, window, cx))
+                        .ok();
+                })
+            })
+        }
     }
 
     fn render_chapters(
@@ -864,7 +904,7 @@ impl ReviewPanel {
             format!("Chapters · {done} of {} reviewed", sections.len()),
             cx,
         )
-        .child(v_flex().gap_1p5().children(rows))
+        .child(v_flex().gap_0p5().children(rows))
     }
 
     fn render_chapter(
@@ -881,7 +921,6 @@ impl ReviewPanel {
         let expanded = self.expanded.contains(&ix);
         let colors = cx.theme().colors();
         let text_muted = colors.text_muted;
-        let divider = colors.border_variant;
         let this = cx.weak_entity();
         let files = section.diffs.len();
         let notes: usize = section.diffs.iter().map(|diff| diff.notes.len()).sum();
@@ -894,30 +933,22 @@ impl ReviewPanel {
             meta.push_str(&format!(" · ✦ {notes}"));
         }
 
-        let border = if selected {
-            colors.border_focused
-        } else {
-            colors.border_variant
-        };
-        let surface = colors.surface_background;
+        let selected_bg = colors.ghost_element_selected;
+        let hover_bg = colors.ghost_element_hover;
         let row = h_flex()
+            .id(("chapter", ix))
             .w_full()
             .items_start()
             .gap_2()
             .px_1p5()
-            .py_1p5()
-            .child(
-                div().pt_0p5().child(
-                    Disclosure::new(("chapter-disclosure", ix), expanded).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            if !this.expanded.remove(&ix) {
-                                this.expanded.insert(ix);
-                            }
-                            cx.notify();
-                        },
-                    )),
-                ),
-            )
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .when(selected, |row| row.bg(selected_bg))
+            .when(!selected, |row| row.hover(move |style| style.bg(hover_bg)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.show_chapter(ix, None, window, cx);
+            }))
             .child(
                 div().pt_0p5().child(
                     Checkbox::new(("chapter-reviewed", ix), ToggleState::from(reviewed)).on_click(
@@ -928,45 +959,42 @@ impl ReviewPanel {
                 ),
             )
             .child(
-                h_flex()
-                    .id(("chapter", ix))
+                div()
+                    .w(px(14.))
+                    .flex_none()
+                    .child(Label::new((ix + 1).to_string()).color(Color::Muted)),
+            )
+            .child(
+                v_flex()
                     .flex_1()
                     .min_w_0()
-                    .items_start()
-                    .gap_1p5()
-                    .cursor_pointer()
                     .child(
-                        div()
-                            .w(px(14.))
-                            .flex_none()
-                            .child(
-                                Label::new((ix + 1).to_string()).color(Color::Muted),
-                            ),
+                        Label::new(section.title.clone())
+                            .color(if reviewed { Color::Muted } else { Color::Default })
+                            .when(reviewed, |label| label.strikethrough()),
                     )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                Label::new(section.title.clone())
-                                    .weight(FontWeight::MEDIUM)
-                                    .color(if reviewed { Color::Muted } else { Color::Default }),
-                            )
-                            .child(Label::new(meta).size(LabelSize::XSmall).color(Color::Muted)),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.show_chapter(ix, None, window, cx);
-                    })),
+                    .child(Label::new(meta).size(LabelSize::XSmall).color(Color::Muted)),
+            )
+            .child(
+                Disclosure::new(("chapter-disclosure", ix), expanded).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if !this.expanded.remove(&ix) {
+                            this.expanded.insert(ix);
+                        }
+                        cx.notify();
+                    },
+                )),
             );
 
+        // The overview and the files, under the title.
         let details = expanded.then(|| {
             v_flex()
-                .mx_1p5()
-                .pt_1p5()
-                .pb_1p5()
+                .pl(px(50.))
+                .pr_1p5()
+                .pt_0p5()
+                .pb_2()
                 .gap_1()
-                .border_t_1()
-                .border_color(divider)
                 .when_some(overview, |el, overview| {
                     el.child(
                         div()
@@ -980,15 +1008,7 @@ impl ReviewPanel {
                 }))
         });
 
-        v_flex()
-            .w_full()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(surface)
-            .child(row)
-            .children(details)
-            .into_any_element()
+        v_flex().w_full().child(row).children(details).into_any_element()
     }
 
     /// One file, drawn like a row of the git panel: icon, name in its git
@@ -1100,7 +1120,8 @@ impl ReviewPanel {
                         div().flex_1().child(
                             Button::new("plannotator-approve", "Approve")
                                 .full_width()
-                                .style(ButtonStyle::Filled)
+                                .style(ButtonStyle::Outlined)
+                                .start_icon(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Success))
                                 .disabled(!has_session)
                                 .on_click(cx.listener(|this, _, window, cx| this.approve(window, cx))),
                         ),
@@ -1109,7 +1130,8 @@ impl ReviewPanel {
                         div().flex_1().child(
                             Button::new("plannotator-send", send_label)
                                 .full_width()
-                                .style(ButtonStyle::Tinted(TintColor::Accent))
+                                .style(ButtonStyle::Filled)
+                                .start_icon(Icon::new(IconName::Send).size(IconSize::Small).color(Color::Accent))
                                 .disabled(!has_session || self.comment_count == 0)
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(SendReviewToAgent.boxed_clone(), cx);
@@ -1118,7 +1140,7 @@ impl ReviewPanel {
                     ),
             )
             .child(
-                Label::new("Posts to the Plannotator session that Claude waits on.")
+                Label::new("Posts to the Plannotator session that Claude waits on. Claude decides whether to post on GitHub.")
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
