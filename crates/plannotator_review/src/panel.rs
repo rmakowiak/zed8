@@ -767,7 +767,8 @@ impl ReviewPanel {
                 h_flex()
                     .w_full()
                     .gap_1p5()
-                    .child(div().flex_1().min_w_0().child(chip))
+                    .child(div().min_w_0().child(chip))
+                    .child(div().flex_1())
                     .when(can_start, |row| {
                         row.child(
                             Button::new("start-session", "Start session")
