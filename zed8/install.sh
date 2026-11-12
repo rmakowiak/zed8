@@ -29,8 +29,11 @@ fi
 
 echo "$(date): waiting for Zed8 and official Zed to quit"
 # Official Zed uses the same data, so it must be closed too.
-while pgrep -f "/Applications/Zed8.app/Contents/MacOS/zed" >/dev/null \
-    || pgrep -f "/Applications/Zed.app/Contents/MacOS/zed" >/dev/null; do
+# The crash handler of an app can outlive the app, so it does not count.
+running() {
+    ps -axo command= | grep -F "$1" | grep -v -e "--crash-handler" -e grep | grep -q .
+}
+while running /Applications/Zed8.app/Contents/MacOS/zed || running /Applications/Zed.app/Contents/MacOS/zed; do
     sleep 1
 done
 
