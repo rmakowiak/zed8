@@ -91,13 +91,6 @@ codesign --force --deep --entitlements "$entitlements" --sign - "$app" >/dev/nul
 echo "Built $app ($version, $commit)"
 
 if [ "$install" = 1 ]; then
-    if pgrep -f "/Applications/Zed8.app/Contents/MacOS/zed" >/dev/null; then
-        echo "Zed8 is running. Quit it, then run: mv '$app' /Applications/ (after removing the old one)."
-        exit 0
-    fi
-    rm -rf /Applications/Zed8.app
-    cp -R "$app" /Applications/Zed8.app
-    mkdir -p "$HOME/.local/bin"
-    ln -sf /Applications/Zed8.app/Contents/MacOS/cli "$HOME/.local/bin/zed8"
-    echo "Installed /Applications/Zed8.app. Command line: zed8 <path>"
+    # Installs now if Zed8 is closed, or as soon as you quit it.
+    exec zed8/install.sh
 fi

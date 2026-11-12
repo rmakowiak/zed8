@@ -15,7 +15,7 @@ Zed8 is Zed plus a review panel for Plannotator, worktree groups in the threads 
 
 - Merge upstream into `zed8`. Do not rebase, and do not force-push.
 - Never push to `upstream`.
-- Do not quit or restart Zed8 without Roman's yes. Quitting it ends the Claude threads that run in it, possibly this one.
+- Never quit or restart Zed8 yourself. Quitting it ends the Claude threads that run in it, possibly this one. `zed8/install.sh` waits until Roman quits it.
 - If you change an upstream file, add a row to `zed8/UPSTREAM.md` in the same commit.
 
 ## Steps
@@ -46,8 +46,8 @@ Zed8 is Zed plus a review panel for Plannotator, worktree groups in the threads 
    The sidebar tests need `-p gpui_platform`. Without it, the Metal shaders do not compile on this Mac. If an upstream sidebar test fails because threads now group by worktree, fix the expected rows in the test.
 8. Build the app: `zed8/bundle.sh --no-install`. The first build in `target/zed8` takes about 20 minutes. Later builds are faster.
 9. Push: `git push origin zed8`. If SSH has no identity, the HTTPS URL above works through the `gh` credential helper.
-10. Install. Ask Roman first. When he says yes, he quits Zed8 (or you quit it with his yes). Then run `zed8/bundle.sh`, which copies the app to `/Applications/Zed8.app`, and open it with `open -a Zed8`.
-11. Report: the number of upstream commits, the conflicts and how you resolved them, the fixes in the crate, the test results, and whether Zed8 is installed.
+10. Report: the number of upstream commits, the conflicts and how you resolved them, the fixes in the crate, the test results. Say that the build is ready.
+11. Install: run `zed8/install.sh`. It waits in the background until Roman quits Zed8, swaps the app and opens Zed8 again. Tell Roman that the build is ready and that Cmd-Q installs it. This session can end when Zed8 quits. That is expected. Never quit Zed8 yourself. The old build stays at `/Applications/Zed8.app.previous`.
 
 ## When the merge goes wrong
 

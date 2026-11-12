@@ -13,7 +13,7 @@ Later, it will also hold plugins for n8n work.
 zed8/bundle.sh
 ```
 
-The script builds `Zed8.app`, copies it to `/Applications`, and links the `zed8` command in `~/.local/bin`. Zed8 uses your real Zed settings and projects. Quit official Zed before you open Zed8. Both apps cannot use the same data at the same time.
+The script builds `Zed8.app` and starts `zed8/install.sh`. The install script waits until you quit Zed8, puts the new app in `/Applications`, opens it, and links the `zed8` command in `~/.local/bin`. The last build stays at `/Applications/Zed8.app.previous`. To go back to it, quit Zed8 and move it back in place. Zed8 uses your real Zed settings and projects. Quit official Zed before you open Zed8. Both apps cannot use the same data at the same time.
 
 On the first start, macOS asks again for the permissions that you gave to Zed, such as Screen Recording and Accessibility.
 
