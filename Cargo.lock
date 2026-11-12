@@ -13525,6 +13525,7 @@ dependencies = [
  "tempfile",
  "terminal",
  "terminal_view",
+ "theme",
  "ui",
  "util",
  "workspace",

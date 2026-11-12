@@ -54,6 +54,9 @@ pub struct Answer {
     pub selected: Vec<String>,
     /// The free-text answer of a text question.
     pub text: String,
+    /// An "Other" answer to a choice question.
+    #[serde(default)]
+    pub other: String,
     pub note: String,
     pub skipped: bool,
 }
@@ -62,12 +65,13 @@ impl Answer {
     pub fn is_empty(&self) -> bool {
         self.selected.is_empty()
             && self.text.trim().is_empty()
+            && self.other.trim().is_empty()
             && self.note.trim().is_empty()
             && !self.skipped
     }
 
-    fn is_answered(&self) -> bool {
-        !self.selected.is_empty() || !self.text.trim().is_empty()
+    pub fn is_answered(&self) -> bool {
+        !self.selected.is_empty() || !self.text.trim().is_empty() || !self.other.trim().is_empty()
     }
 }
 
@@ -421,6 +425,7 @@ fn answers_section(blocks: &[SpecBlock], answers: &HashMap<String, Answer>) -> S
 fn answer_lines(question: &Question, answer: &Answer) -> String {
     let mut out = String::new();
     let is_recommended = answer.is_answered()
+        && answer.other.trim().is_empty()
         && ((!answer.selected.is_empty() && {
             let mut selected = answer.selected.clone();
             let mut recommended = question.recommended.clone();
@@ -432,14 +437,18 @@ fn answer_lines(question: &Question, answer: &Answer) -> String {
             .as_deref()
             .is_some_and(|suggested| normalize(suggested) == normalize(&answer.text)));
     let rec = if is_recommended { " (your recommendation)" } else { "" };
+    let mut picks = answer.selected.clone();
+    if !answer.other.trim().is_empty() {
+        picks.push(format!("Other: {}", answer.other.trim().replace('\n', " ")));
+    }
     if !answer.text.trim().is_empty() {
         out.push_str(&format!("Answer{rec}:\n> {}\n", answer.text.trim().replace('\n', "\n> ")));
-    } else if answer.selected.len() > 1 {
+    } else if picks.len() > 1 {
         out.push_str(&format!("Answer{rec}:\n"));
-        for label in &answer.selected {
+        for label in &picks {
             out.push_str(&format!("- {label}\n"));
         }
-    } else if let Some(label) = answer.selected.first() {
+    } else if let Some(label) = picks.first() {
         out.push_str(&format!("Answer: {label}{rec}\n"));
     } else if answer.skipped {
         out.push_str("Skipped\n");
@@ -511,6 +520,17 @@ mod tests {
              ## 1. (lines 3–4) Feedback on: \"First paragraph.\"\n> Say why.\n\n---\n"
         );
         assert_eq!(export_feedback(&blocks, &[], &HashMap::default()), "No changes detected.");
+    }
+
+    #[test]
+    fn exports_other_answers() {
+        let blocks = parse(SPEC);
+        let key = blocks[3].question.as_ref().unwrap().key.clone();
+        let answers = HashMap::from_iter([(
+            key,
+            Answer { other: "Both".into(), ..Answer::default() },
+        )]);
+        assert!(export_feedback(&blocks, &[], &answers).contains("### Q1. Where do we keep drafts? (line 12)\nAnswer: Other: Both\n"));
     }
 
     #[test]

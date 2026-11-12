@@ -169,18 +169,29 @@ fn claude_terminal(workspace: &Workspace, live: bool, cx: &App) -> Option<Entity
         .cloned()
 }
 
-/// The title that Claude Code gives its terminal, such as the thread name.
-pub(crate) fn claude_thread_title(workspace: &Workspace, cx: &App) -> Option<String> {
+/// The Claude Code terminal that Zed types into: its title (the thread name)
+/// and whether Claude is working. Claude Code puts ✳ before the title when
+/// it is idle, and a spinner frame while it works.
+pub(crate) struct ClaudeThread {
+    pub title: String,
+    pub busy: bool,
+}
+
+pub(crate) fn claude_thread(workspace: &Workspace, cx: &App) -> Option<ClaudeThread> {
     let terminal = claude_terminal(workspace, false, cx)?;
     let terminal = terminal.read(cx);
-    let title = if terminal.breadcrumb_text.is_empty() {
+    let raw = if terminal.breadcrumb_text.is_empty() {
         terminal.title(true)
     } else {
         terminal.breadcrumb_text.clone()
     };
-    // Claude Code puts a spinner or a mark before its title.
-    let title = title.trim_start_matches(|c: char| !c.is_alphanumeric()).trim().to_string();
-    (!title.is_empty()).then_some(title)
+    let raw = raw.trim();
+    let mark = raw.chars().next().filter(|c| !c.is_alphanumeric());
+    let title = raw.trim_start_matches(|c: char| !c.is_alphanumeric()).trim().to_string();
+    Some(ClaudeThread {
+        title: if title.is_empty() { "Claude Code".to_string() } else { title },
+        busy: mark.is_some_and(|mark| mark != '✳'),
+    })
 }
 
 /// The command name of a running process, read with `ps`. Zed's cached

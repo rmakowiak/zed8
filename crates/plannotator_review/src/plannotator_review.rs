@@ -93,6 +93,20 @@ fn send_review(
 
     cx.spawn_in(window, async move |workspace, cx| {
         let result = post_feedback(http, &session.url, &comments, &worktree).await;
+        if result.is_ok() {
+            workspace
+                .update(cx, |workspace, cx| {
+                    if let Some(panel) = workspace.panel::<panel::ReviewPanel>(cx) {
+                        let at = chrono::Local::now().format("%H:%M");
+                        let sent = panel::CodeSent {
+                            message: format!("Sent {count} comments at {at}"),
+                            approved: false,
+                        };
+                        panel.update(cx, |panel, cx| panel.mark_code_sent(sent, cx));
+                    }
+                })
+                .log_err();
+        }
         let message = match &result {
             Ok(()) => format!("Sent {count} review comments to Plannotator"),
             Err(error) => {

@@ -6,7 +6,7 @@ use crate::{
     guide::{self, LoadedGuide},
     panel_state::{PanelState, announce_roots, load_state},
     session::Session,
-    spec_view::SpecReviewView,
+    spec_view::{SpecReviewView, SpecViewEvent},
     start,
 };
 use editor::{EditorEvent, actions::SendReviewToAgent};
@@ -23,7 +23,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use file_icons::FileIcons;
-use ui::{Checkbox, Disclosure, TintColor, ToggleState, Tooltip, prelude::*};
+use ui::{Checkbox, Disclosure, SpinnerLabel, TintColor, ToggleState, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
@@ -39,6 +39,20 @@ actions!(
 );
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+#[derive(Clone)]
+struct SpecResult {
+    target: String,
+    approved: bool,
+    /// The local time of the send, such as `23:03`.
+    at: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct CodeSent {
+    pub message: String,
+    pub approved: bool,
+}
+
 pub struct ReviewPanel {
     workspace: WeakEntity<Workspace>,
     http: Arc<dyn HttpClient>,
@@ -51,6 +65,11 @@ pub struct ReviewPanel {
     expanded: HashSet<usize>,
     /// Unsent inline comments in the open chapter tab.
     comment_count: usize,
+    /// Specs that went back to Claude, until their next round opens.
+    spec_results: Vec<SpecResult>,
+    /// Code review feedback sent from Zed, until the next session starts.
+    code_sent: Option<CodeSent>,
+    _spec_subscriptions: Vec<Subscription>,
     /// Rendered chapter overviews, by guide id and chapter.
     overviews: HashMap<(String, usize), Entity<Markdown>>,
     _chapter_subscription: Option<Subscription>,
@@ -86,25 +105,24 @@ impl ReviewPanel {
                     // A new guide or a new session means Claude just started a review.
                     let guide_id = |state: &PanelState| state.guide.as_ref().map(|guide| guide.id.clone());
                     let session_pid = |state: &PanelState| state.session.as_ref().map(|session| session.pid);
-                    let new_specs: Vec<Session> = if first_load {
-                        Vec::new()
-                    } else {
-                        state
-                            .specs
-                            .iter()
-                            .filter(|spec| !this.state.specs.iter().any(|old| old.pid == spec.pid))
-                            .cloned()
-                            .collect()
-                    };
-                    let reveal = !first_load
-                        && ((guide_id(&state).is_some() && guide_id(&state) != guide_id(&this.state))
-                            || (session_pid(&state).is_some()
-                                && session_pid(&state) != session_pid(&this.state))
-                            || !new_specs.is_empty());
-                    if this.state != state {
-                        this.state = state;
-                        cx.notify();
+                    // On the first load too: a spec that waits when Zed starts opens.
+                    let new_specs: Vec<Session> = state
+                        .specs
+                        .iter()
+                        .filter(|spec| !this.state.specs.iter().any(|old| old.pid == spec.pid))
+                        .cloned()
+                        .collect();
+                    let reveal = !new_specs.is_empty()
+                        || !first_load
+                            && ((guide_id(&state).is_some() && guide_id(&state) != guide_id(&this.state))
+                                || (session_pid(&state).is_some()
+                                    && session_pid(&state) != session_pid(&this.state)));
+                    if session_pid(&state).is_some() && session_pid(&state) != session_pid(&this.state) {
+                        this.code_sent = None;
                     }
+                    this.state = state;
+                    // Also follows Claude's working state, which lives in a terminal title.
+                    cx.notify();
                     (reveal, new_specs, this.workspace.clone())
                 }) else {
                     return;
@@ -135,6 +153,9 @@ impl ReviewPanel {
             expanded: HashSet::default(),
             comment_count: 0,
             overviews: HashMap::default(),
+            spec_results: Vec::new(),
+            code_sent: None,
+            _spec_subscriptions: Vec::new(),
             _chapter_subscription: None,
             _poll: poll,
         }
@@ -183,14 +204,21 @@ impl ReviewPanel {
         };
         let http = self.http.clone();
         let workspace = self.workspace.clone();
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let body = serde_json::json!({ "approved": true, "feedback": "", "annotations": [] });
             let result =
                 crate::client::send_json(&http, Method::POST, &format!("{}/api/feedback", session.url), &body).await;
-            let message = match result {
+            let message = match &result {
                 Ok(()) => "Approved. Plannotator told Claude.".to_string(),
                 Err(error) => format!("Approve failed: {error}"),
             };
+            if result.is_ok() {
+                this.update(cx, |this, cx| {
+                    let at = chrono::Local::now().format("%H:%M");
+                    this.mark_code_sent(CodeSent { message: format!("Approved at {at}"), approved: true }, cx)
+                })
+                .log_err();
+            }
             workspace
                 .update(cx, |workspace, cx| crate::show_toast(workspace, message, cx))
                 .log_err();
@@ -265,53 +293,88 @@ impl ReviewPanel {
     /// Claude starting a spec review opens it without focus.
     fn open_spec(&mut self, spec: Session, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         let http = self.http.clone();
-        self.workspace
+        let target = spec.target.clone().unwrap_or_default();
+        let opened = self
+            .workspace
             .update(cx, |workspace, cx| {
                 let existing = workspace
                     .items_of_type::<SpecReviewView>(cx)
                     .find(|view| view.read(cx).session_pid() == spec.pid);
                 if let Some(view) = existing {
                     workspace.activate_item(&view, true, focus, window, cx);
-                    return;
+                    return None;
                 }
-                // A finished earlier round of the same file is closed.
-                let finished: Vec<_> = workspace
+                // Only the latest round of a file stays open. Drafts are on disk.
+                let earlier_rounds: Vec<_> = workspace
                     .items_of_type::<SpecReviewView>(cx)
-                    .filter(|view| {
-                        let view = view.read(cx);
-                        view.is_finished() && view.target() == spec.target.as_deref()
-                    })
+                    .filter(|view| view.read(cx).target() == spec.target.as_deref())
                     .collect();
                 let view = cx.new(|cx| SpecReviewView::new(spec, http, window, cx));
                 workspace.active_pane().update(cx, |pane, cx| {
-                    pane.add_item(Box::new(view), true, focus, None, window, cx);
+                    pane.add_item(Box::new(view.clone()), true, focus, None, window, cx);
                 });
-                crate::close_items(workspace, finished, window, cx);
+                crate::close_items(workspace, earlier_rounds, window, cx);
+                Some(view)
             })
-            .log_err();
+            .log_err()
+            .flatten();
+        let Some(view) = opened else {
+            return;
+        };
+        self.spec_results.retain(|result| result.target != target);
+        self._spec_subscriptions.push(cx.subscribe(&view, move |this, _, event, cx| {
+            let SpecViewEvent::Finished { approved } = event;
+            this.spec_results.retain(|result| result.target != target);
+            this.spec_results.push(SpecResult {
+                target: target.clone(),
+                approved: *approved,
+                at: chrono::Local::now().format("%H:%M").to_string(),
+            });
+            cx.notify();
+        }));
+        cx.notify();
+    }
+
+    /// Code review feedback left Zed. The panel shows it until a new session.
+    pub(crate) fn mark_code_sent(&mut self, sent: CodeSent, cx: &mut Context<Self>) {
+        self.code_sent = Some(sent);
+        cx.notify();
+    }
+
+    fn claude_thread(&self, cx: &App) -> Option<start::ClaudeThread> {
+        let workspace = self.workspace.upgrade()?;
+        start::claude_thread(workspace.read(cx), cx)
     }
 
     fn render_specs(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.state.specs.is_empty() {
+        let results: Vec<SpecResult> = self
+            .spec_results
+            .iter()
+            .filter(|result| {
+                !self.state.specs.iter().any(|spec| spec.target.as_deref() == Some(&result.target))
+            })
+            .cloned()
+            .collect();
+        if self.state.specs.is_empty() && results.is_empty() {
             return None;
         }
         let colors = cx.theme().colors();
         let hover = colors.ghost_element_hover;
-        let rows: Vec<AnyElement> = self
+        let busy = self.claude_thread(cx).is_some_and(|thread| thread.busy);
+        let name_and_dir = |target: &str| {
+            let path = Path::new(target);
+            (
+                path.file_name().and_then(|name| name.to_str()).unwrap_or("spec").to_string(),
+                path.parent().map(|dir| dir.display().to_string()).unwrap_or_default(),
+            )
+        };
+        let mut rows: Vec<AnyElement> = self
             .state
             .specs
             .iter()
             .map(|spec| {
                 let target = spec.target.clone().unwrap_or_default();
-                let name = Path::new(&target)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("spec")
-                    .to_string();
-                let dir = Path::new(&target)
-                    .parent()
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_default();
+                let (name, dir) = name_and_dir(&target);
                 let spec = spec.clone();
                 h_flex()
                     .id(("spec", spec.pid as usize))
@@ -334,11 +397,56 @@ impl ReviewPanel {
                             .min_w_0()
                             .child(Label::new(dir).size(LabelSize::XSmall).color(Color::Muted).truncate_start()),
                     )
+                    .child(Label::new("your turn").size(LabelSize::XSmall).color(Color::Accent))
                     .into_any_element()
             })
             .collect();
+        for result in results {
+            let (name, _) = name_and_dir(&result.target);
+            let (mark, text, color): (AnyElement, String, Color) = if result.approved {
+                (
+                    Icon::new(IconName::Check).size(IconSize::Small).color(Color::Success).into_any_element(),
+                    format!("Approved at {}", result.at),
+                    Color::Success,
+                )
+            } else if busy {
+                (
+                    SpinnerLabel::new().size(LabelSize::Small).color(Color::Accent).into_any_element(),
+                    format!("Sent at {}. Claude is working on the next round.", result.at),
+                    Color::Accent,
+                )
+            } else {
+                (
+                    Icon::new(IconName::Check).size(IconSize::Small).color(Color::Muted).into_any_element(),
+                    format!("Sent at {}. Waiting for the next round.", result.at),
+                    Color::Muted,
+                )
+            };
+            let target = result.target.clone();
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .px_1()
+                    .py_0p5()
+                    .gap_1p5()
+                    .child(mark)
+                    .child(Label::new(name).size(LabelSize::Small))
+                    .child(div().flex_1().min_w_0().child(Label::new(text).size(LabelSize::XSmall).color(color).truncate()))
+                    .child(
+                        IconButton::new(SharedString::from(format!("dismiss-{target}")), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Hide"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.spec_results.retain(|result| result.target != target);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
         Some(
-            Self::render_section("Spec review · Claude waits".to_string(), cx)
+            Self::render_section("Spec review".to_string(), cx)
                 .child(v_flex().gap_0p5().children(rows))
                 .into_any_element(),
         )
@@ -494,18 +602,45 @@ impl ReviewPanel {
             ),
             None => (Color::Muted, "No review session".to_string()),
         };
-        let can_start = self.state.session.is_none() && self.state.guide.is_some();
-        let thread = self
-            .workspace
-            .upgrade()
-            .and_then(|workspace| start::claude_thread_title(workspace.read(cx), cx));
+        let thread = self.claude_thread(cx);
+        let busy = thread.as_ref().is_some_and(|thread| thread.busy);
+        let code_sent = self.code_sent.clone().filter(|_| self.state.session.is_none());
+        let can_start = self.state.session.is_none() && self.state.guide.is_some() && code_sent.is_none();
+        let status: AnyElement = match &code_sent {
+            Some(sent) if sent.approved => h_flex()
+                .gap_1p5()
+                .child(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Success))
+                .child(Label::new(sent.message.clone()).size(LabelSize::Small).color(Color::Success))
+                .into_any_element(),
+            Some(sent) => h_flex()
+                .gap_1p5()
+                .child(if busy {
+                    SpinnerLabel::new().size(LabelSize::Small).color(Color::Accent).into_any_element()
+                } else {
+                    Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent).into_any_element()
+                })
+                .child(
+                    Label::new(if busy {
+                        format!("{}. Claude is working on it.", sent.message)
+                    } else {
+                        format!("{}. Claude has it.", sent.message)
+                    })
+                    .size(LabelSize::Small)
+                    .color(Color::Accent),
+                )
+                .into_any_element(),
+            None => h_flex()
+                .gap_1p5()
+                .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(color))
+                .child(Label::new(text).size(LabelSize::Small))
+                .into_any_element(),
+        };
         Self::render_section("Sends to".to_string(), cx)
             .child(
             h_flex()
                 .w_full()
                 .gap_1p5()
-                .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(color))
-                .child(div().flex_1().child(Label::new(text).size(LabelSize::Small)))
+                .child(div().flex_1().min_w_0().child(status))
                 .when(can_start, |row| {
                     row.child(
                         Button::new("start-session", "Start session")
@@ -523,14 +658,17 @@ impl ReviewPanel {
                     .gap_1p5()
                     .child(Icon::new(IconName::Terminal).size(IconSize::XSmall).color(Color::Muted))
                     .child(
-                        Label::new(match thread {
-                            Some(title) => format!("Claude thread: {title}"),
+                        Label::new(match &thread {
+                            Some(thread) => format!("Claude thread: {}", thread.title),
                             None => "No Claude Code terminal open".to_string(),
                         })
                         .size(LabelSize::XSmall)
                         .color(Color::Muted)
                         .truncate(),
-                    ),
+                    )
+                    .when(busy, |row| {
+                        row.child(Label::new("working").size(LabelSize::XSmall).color(Color::Accent))
+                    }),
             )
     }
 
