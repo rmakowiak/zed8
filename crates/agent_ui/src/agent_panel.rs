@@ -4057,6 +4057,11 @@ impl AgentPanel {
         }
     }
 
+    /// The view of one terminal thread, open or in the background.
+    pub fn terminal_view(&self, terminal_id: TerminalId) -> Option<&Entity<TerminalView>> {
+        self.terminals.get(&terminal_id).map(|terminal| &terminal.view)
+    }
+
     pub fn visible_terminal_view(&self) -> Option<&Entity<TerminalView>> {
         match self.visible_surface() {
             VisibleSurface::Terminal(terminal_view) => Some(terminal_view),

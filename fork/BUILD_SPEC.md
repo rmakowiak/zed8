@@ -77,7 +77,11 @@ All five steps work, tested by hand on 2026-11-11 against PR #43508 and a test s
 - Mermaid renders as a text diagram with `~/.local/bin/mermaid-ascii`, not as an image with `mmdc`. `mmdc` needs a headless Chromium.
 - Spec review is its own tab, not the markdown preview. The preview has no hook for comments and question cards.
 - "Review PR" is in the Review panel and the command palette, not in the git panel or the branch diff toolbar. Those need upstream hooks.
-- The panel shows the Claude thread that Zed types into. Plannotator sessions do not record which thread started them, so there is no thread picker.
+- Plannotator sessions do not record which thread started them. Zed finds the thread from the process tree: the Plannotator server runs below the Claude process of a terminal.
+- Several review sessions on one worktree: the panel lists each session with its thread, and you pick the one that gets Send feedback and Approve. Without a pick, the newest session gets them.
+- "Review PR" and "Start session" go to the thread of the picked session. Without a session, the panel lists the Claude threads and you pick one.
+- A new spec round on a file dismisses an earlier session of that file that still waits (`POST /api/exit`), so its Claude stops waiting.
+- The threads sidebar groups the rows of a project by worktree when they come from more than one worktree. The worktree with the newest thread comes first. This change is in `crates/sidebar/src/sidebar.rs` (`push_entries_by_display_time`, `render_worktree_heading`).
 - Plannotator keeps no record of earlier comments. Zed keeps the last sent round in `~/.plannotator/zed-drafts/` and compares it with the new text.
 - The browser fallback needs `PLANNOTATOR_BROWSER` set to `fork/plannotator-browser` (see "Turn on the browser hook").
 

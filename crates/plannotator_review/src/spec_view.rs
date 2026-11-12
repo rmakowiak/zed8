@@ -147,6 +147,10 @@ impl SpecReviewView {
         self.session.pid
     }
 
+    pub fn session_url(&self) -> &str {
+        &self.session.url
+    }
+
     pub fn target(&self) -> Option<&str> {
         self.session.target.as_deref()
     }
@@ -1025,7 +1029,7 @@ fn eyebrow(text: &str) -> impl IntoElement {
 
 /// A radio mark for pick one, a check box for pick any. `other` draws the
 /// dashed "+" mark of an empty Other row.
-fn control(kind: QuestionKind, selected: bool, other: bool, colors: &ThemeColors) -> AnyElement {
+pub(crate) fn control(kind: QuestionKind, selected: bool, other: bool, colors: &ThemeColors) -> AnyElement {
     let accent = colors.text_accent;
     let round = kind != QuestionKind::Multi;
     let mark = div()

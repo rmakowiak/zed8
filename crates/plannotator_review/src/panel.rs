@@ -11,7 +11,7 @@ use crate::{
 };
 use editor::{EditorEvent, actions::SendReviewToAgent};
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Pixels,
+    Action, App, Context, ElementId, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight, Pixels,
     Render, Subscription, Task, WeakEntity, Window, actions, px,
 };
 use http_client::{HttpClient, Method};
@@ -42,6 +42,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 struct SpecResult {
     target: String,
+    /// The session that got the answer. It finds the Claude thread.
+    session: Session,
     approved: bool,
     /// The local time of the send, such as `23:03`.
     at: String,
@@ -69,6 +71,12 @@ pub struct ReviewPanel {
     spec_results: Vec<SpecResult>,
     /// Code review feedback sent from Zed, until the next session starts.
     code_sent: Option<CodeSent>,
+    /// The review session picked in the panel, by pid. Without a pick, or
+    /// after it ends, the newest session gets the feedback.
+    chosen_session: Option<i32>,
+    /// The Claude terminal picked in the panel, for a worktree without a
+    /// review session.
+    chosen_thread: Option<EntityId>,
     _spec_subscriptions: Vec<Subscription>,
     /// Rendered chapter overviews, by guide id and chapter.
     overviews: HashMap<(String, usize), Entity<Markdown>>,
@@ -104,7 +112,7 @@ impl ReviewPanel {
                 let Ok((reveal, new_specs, workspace)) = this.update(cx, |this, cx| {
                     // A new guide or a new session means Claude just started a review.
                     let guide_id = |state: &PanelState| state.guide.as_ref().map(|guide| guide.id.clone());
-                    let session_pid = |state: &PanelState| state.session.as_ref().map(|session| session.pid);
+                    let session_pid = |state: &PanelState| state.sessions.first().map(|session| session.pid);
                     // On the first load too: a spec that waits when Zed starts opens.
                     let new_specs: Vec<Session> = state
                         .specs
@@ -155,6 +163,8 @@ impl ReviewPanel {
             overviews: HashMap::default(),
             spec_results: Vec::new(),
             code_sent: None,
+            chosen_session: None,
+            chosen_thread: None,
             _spec_subscriptions: Vec::new(),
             _chapter_subscription: None,
             _poll: poll,
@@ -182,7 +192,7 @@ impl ReviewPanel {
 
         let path = guide.path.clone();
         let id = guide.id.clone();
-        let session_url = self.state.session.as_ref().map(|session| session.url.clone());
+        let session_url = self.session().map(|session| session.url.clone());
         let http = self.http.clone();
         cx.background_spawn(async move {
             // A live session owns the guide store, so it writes the file itself.
@@ -199,7 +209,7 @@ impl ReviewPanel {
     }
 
     fn approve(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.state.session.clone() else {
+        let Some(session) = self.session().cloned() else {
             return;
         };
         let http = self.http.clone();
@@ -294,6 +304,7 @@ impl ReviewPanel {
     fn open_spec(&mut self, spec: Session, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         let http = self.http.clone();
         let target = spec.target.clone().unwrap_or_default();
+        let session = spec.clone();
         let opened = self
             .workspace
             .update(cx, |workspace, cx| {
@@ -309,7 +320,20 @@ impl ReviewPanel {
                     .items_of_type::<SpecReviewView>(cx)
                     .filter(|view| view.read(cx).target() == spec.target.as_deref())
                     .collect();
-                let view = cx.new(|cx| SpecReviewView::new(spec, http, window, cx));
+                // An earlier round that still waits would keep its Claude
+                // waiting. Dismiss it, as closing it in Plannotator does.
+                for earlier in &earlier_rounds {
+                    let earlier = earlier.read(cx);
+                    if earlier.session_pid() != spec.pid {
+                        let url = format!("{}/api/exit", earlier.session_url());
+                        let http = http.clone();
+                        cx.background_spawn(async move {
+                            crate::client::send_json(&http, Method::POST, &url, &serde_json::json!({})).await
+                        })
+                        .detach();
+                    }
+                }
+                let view = cx.new(|cx| SpecReviewView::new(spec.clone(), http, window, cx));
                 workspace.active_pane().update(cx, |pane, cx| {
                     pane.add_item(Box::new(view.clone()), true, focus, None, window, cx);
                 });
@@ -327,6 +351,7 @@ impl ReviewPanel {
             this.spec_results.retain(|result| result.target != target);
             this.spec_results.push(SpecResult {
                 target: target.clone(),
+                session: session.clone(),
                 approved: *approved,
                 at: chrono::Local::now().format("%H:%M").to_string(),
             });
@@ -341,9 +366,62 @@ impl ReviewPanel {
         cx.notify();
     }
 
-    fn claude_thread(&self, cx: &App) -> Option<start::ClaudeThread> {
-        let workspace = self.workspace.upgrade()?;
-        start::claude_thread(workspace.read(cx), cx)
+    /// The review session that gets Send feedback and Approve.
+    pub(crate) fn session(&self) -> Option<&Session> {
+        let sessions = &self.state.sessions;
+        self.chosen_session
+            .and_then(|pid| sessions.iter().find(|session| session.pid == pid))
+            .or(sessions.first())
+    }
+
+    pub(crate) fn chosen_thread(&self) -> Option<EntityId> {
+        self.chosen_thread
+    }
+
+    fn claude_terminals(&self, cx: &App) -> Vec<start::ClaudeTerminal> {
+        self.workspace
+            .upgrade()
+            .map(|workspace| start::claude_terminals(workspace.read(cx), false, cx))
+            .unwrap_or_default()
+    }
+
+    /// Shows the Claude thread in the Agent panel.
+    fn open_thread(&self, target: &start::ClaudeTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        let target = target.clone();
+        self.workspace
+            .update(cx, |workspace, cx| start::open_terminal(workspace, &target, window, cx))
+            .log_err();
+    }
+
+    /// A small, muted row with the name of the Claude thread behind a session.
+    fn render_thread_label(
+        id: impl Into<ElementId>,
+        owner: Option<&start::ClaudeTerminal>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(owner) = owner.cloned() else {
+            return Label::new("Thread not open in this window")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element();
+        };
+        let hover = cx.theme().colors().ghost_element_hover;
+        h_flex()
+            .id(id.into())
+            .gap_1()
+            .min_w_0()
+            .px_0p5()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .tooltip(Tooltip::text("Open this Claude thread"))
+            .child(Icon::new(IconName::Terminal).size(IconSize::XSmall).color(Color::Muted))
+            .child(Label::new(owner.title.clone()).size(LabelSize::XSmall).color(Color::Muted).truncate())
+            .when(owner.busy, |row| {
+                row.child(Label::new("working").size(LabelSize::XSmall).color(Color::Accent))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| this.open_thread(&owner, window, cx)))
+            .into_any_element()
     }
 
     fn render_specs(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -360,7 +438,8 @@ impl ReviewPanel {
         }
         let colors = cx.theme().colors();
         let hover = colors.ghost_element_hover;
-        let busy = self.claude_thread(cx).is_some_and(|thread| thread.busy);
+        let terminals = self.claude_terminals(cx);
+        let owner = |session: &Session| terminals.iter().find(|terminal| terminal.owns(session)).cloned();
         let name_and_dir = |target: &str| {
             let path = Path::new(target);
             (
@@ -375,8 +454,9 @@ impl ReviewPanel {
             .map(|spec| {
                 let target = spec.target.clone().unwrap_or_default();
                 let (name, dir) = name_and_dir(&target);
+                let thread = Self::render_thread_label(("spec-thread", spec.pid as usize), owner(spec).as_ref(), cx);
                 let spec = spec.clone();
-                h_flex()
+                let row = h_flex()
                     .id(("spec", spec.pid as usize))
                     .w_full()
                     .px_1()
@@ -397,12 +477,13 @@ impl ReviewPanel {
                             .min_w_0()
                             .child(Label::new(dir).size(LabelSize::XSmall).color(Color::Muted).truncate_start()),
                     )
-                    .child(Label::new("your turn").size(LabelSize::XSmall).color(Color::Accent))
-                    .into_any_element()
+                    .child(Label::new("your turn").size(LabelSize::XSmall).color(Color::Accent));
+                v_flex().w_full().child(row).child(div().pl_6().child(thread)).into_any_element()
             })
             .collect();
         for result in results {
             let (name, _) = name_and_dir(&result.target);
+            let busy = owner(&result.session).is_some_and(|owner| owner.busy);
             let (mark, text, color): (AnyElement, String, Color) = if result.approved {
                 (
                     Icon::new(IconName::Check).size(IconSize::Small).color(Color::Success).into_any_element(),
@@ -591,21 +672,13 @@ impl ReviewPanel {
         }
     }
 
-    fn render_session(&self, cx: &App) -> impl IntoElement {
-        let (color, text) = match &self.state.session {
-            Some(session) => (
-                Color::Success,
-                format!(
-                    "Claude, through Plannotator ({})",
-                    session.url.trim_start_matches("http://localhost:")
-                ),
-            ),
-            None => (Color::Muted, "No review session".to_string()),
-        };
-        let thread = self.claude_thread(cx);
-        let busy = thread.as_ref().is_some_and(|thread| thread.busy);
-        let code_sent = self.code_sent.clone().filter(|_| self.state.session.is_none());
-        let can_start = self.state.session.is_none() && self.state.guide.is_some() && code_sent.is_none();
+    fn render_session(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let terminals = self.claude_terminals(cx);
+        let session = self.session().cloned();
+        let target = start::pick_terminal(&terminals, session.as_ref(), self.chosen_thread).cloned();
+        let busy = target.as_ref().is_some_and(|target| target.busy);
+        let code_sent = self.code_sent.clone().filter(|_| session.is_none());
+        let can_start = session.is_none() && self.state.guide.is_some() && code_sent.is_none();
         let status: AnyElement = match &code_sent {
             Some(sent) if sent.approved => h_flex()
                 .gap_1p5()
@@ -629,14 +702,23 @@ impl ReviewPanel {
                     .color(Color::Accent),
                 )
                 .into_any_element(),
-            None => h_flex()
-                .gap_1p5()
-                .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(color))
-                .child(Label::new(text).size(LabelSize::Small))
-                .into_any_element(),
+            None => match &session {
+                Some(session) => h_flex()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(Color::Success))
+                    .child(
+                        Label::new(format!("Claude, through Plannotator ({})", session.port()))
+                            .size(LabelSize::Small),
+                    )
+                    .into_any_element(),
+                None => h_flex()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Label::new("No review session").size(LabelSize::Small))
+                    .into_any_element(),
+            },
         };
-        Self::render_section("Sends to".to_string(), cx)
-            .child(
+        let mut section = Self::render_section("Sends to".to_string(), cx).child(
             h_flex()
                 .w_full()
                 .gap_1p5()
@@ -652,24 +734,117 @@ impl ReviewPanel {
                             }),
                     )
                 }),
-        )
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .child(Icon::new(IconName::Terminal).size(IconSize::XSmall).color(Color::Muted))
-                    .child(
-                        Label::new(match &thread {
-                            Some(thread) => format!("Claude thread: {}", thread.title),
-                            None => "No Claude Code terminal open".to_string(),
-                        })
+        );
+
+        // Several sessions: one row each, and you pick which one gets the feedback.
+        if self.state.sessions.len() > 1 {
+            let chosen = session.as_ref().map(|session| session.pid);
+            let rows: Vec<AnyElement> = self
+                .state
+                .sessions
+                .iter()
+                .map(|candidate| {
+                    let pid = candidate.pid;
+                    let owner = terminals.iter().find(|terminal| terminal.owns(candidate));
+                    let selected = chosen == Some(pid);
+                    v_flex()
+                        .w_full()
+                        .child(
+                            h_flex()
+                                .id(("session", pid as usize))
+                                .w_full()
+                                .gap_1p5()
+                                .cursor_pointer()
+                                .child(
+                                    crate::spec_view::control(crate::spec_doc::QuestionKind::Single, selected, false, cx.theme().colors()),
+                                )
+                                .child(
+                                    Label::new(format!(
+                                        "Session {} · started {}",
+                                        candidate.port(),
+                                        candidate.started_label()
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(if selected { Color::Default } else { Color::Muted }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.chosen_session = Some(pid);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().pl_5().child(Self::render_thread_label(
+                            ("session-thread", pid as usize),
+                            owner,
+                            cx,
+                        )))
+                        .into_any_element()
+                })
+                .collect();
+            return section
+                .child(
+                    Label::new("Several Claude threads review this worktree. Pick one:")
                         .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate(),
-                    )
-                    .when(busy, |row| {
-                        row.child(Label::new("working").size(LabelSize::XSmall).color(Color::Accent))
-                    }),
-            )
+                        .color(Color::Muted),
+                )
+                .child(v_flex().gap_1().children(rows));
+        }
+
+        // No session and several Claude threads: pick the one that gets "Review PR".
+        if session.is_none() && terminals.len() > 1 {
+            let chosen = target.as_ref().map(|target| target.id());
+            let rows: Vec<AnyElement> = terminals
+                .iter()
+                .enumerate()
+                .map(|(ix, terminal)| {
+                    let id = terminal.id();
+                    let selected = chosen == Some(id);
+                    h_flex()
+                        .id(("thread-choice", ix))
+                        .w_full()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .child(
+                            crate::spec_view::control(crate::spec_doc::QuestionKind::Single, selected, false, cx.theme().colors()),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(terminal.title.clone())
+                                    .size(LabelSize::Small)
+                                    .color(if selected { Color::Default } else { Color::Muted })
+                                    .truncate(),
+                            ),
+                        )
+                        .when(terminal.busy, |row| {
+                            row.child(Label::new("working").size(LabelSize::XSmall).color(Color::Accent))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.chosen_thread = Some(id);
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                })
+                .collect();
+            return section
+                .child(
+                    Label::new("Claude thread for Review PR and Start session:")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(v_flex().gap_1().children(rows));
+        }
+
+        let owner = match &session {
+            Some(session) => terminals.iter().find(|terminal| terminal.owns(session)).cloned(),
+            None => target.clone(),
+        };
+        section = section.child(match (&session, &owner) {
+            (Some(_), _) | (None, Some(_)) => Self::render_thread_label("session-thread", owner.as_ref(), cx),
+            (None, None) => Label::new("No Claude Code terminal open")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+        });
+        section
     }
 
     fn render_chapters(
@@ -904,7 +1079,7 @@ impl ReviewPanel {
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_session = self.state.session.is_some();
+        let has_session = self.session().is_some();
         let send_label = if self.comment_count > 0 {
             format!("Send feedback ({})", self.comment_count)
         } else {

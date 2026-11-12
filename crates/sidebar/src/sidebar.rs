@@ -505,7 +505,17 @@ struct SidebarContents {
     notified_threads: HashSet<agent_ui::ThreadId>,
     notified_terminals: HashSet<TerminalId>,
     project_header_indices: Vec<usize>,
+    /// Worktree headings, by the index of the first entry under each. A
+    /// project group gets them when its threads run in more than one worktree.
+    worktree_headings: HashMap<usize, WorktreeHeading>,
     has_open_projects: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreeHeading {
+    name: SharedString,
+    branch: Option<SharedString>,
+    full_path: SharedString,
 }
 
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
@@ -521,8 +531,9 @@ enum EntryShape {
         // `!is_collapsed && !has_threads`).
         is_collapsed: bool,
     },
-    Thread(ThreadId),
-    Terminal(TerminalId),
+    /// The flag is true when a worktree heading renders above the row.
+    Thread(ThreadId, bool),
+    Terminal(TerminalId, bool),
 }
 
 impl SidebarContents {
@@ -1438,6 +1449,7 @@ impl Sidebar {
         let mut current_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut current_terminal_ids: HashSet<TerminalId> = HashSet::new();
         let mut project_header_indices: Vec<usize> = Vec::new();
+        let mut worktree_headings: HashMap<usize, WorktreeHeading> = HashMap::new();
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut seen_terminal_ids: HashSet<TerminalId> = HashSet::new();
 
@@ -1971,6 +1983,7 @@ impl Sidebar {
                     matched_threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                    &mut worktree_headings,
                 );
             } else {
                 let has_terminal_notifications = terminals
@@ -2021,6 +2034,7 @@ impl Sidebar {
                     threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                    &mut worktree_headings,
                 );
             }
         }
@@ -2039,6 +2053,7 @@ impl Sidebar {
             notified_threads,
             notified_terminals,
             project_header_indices,
+            worktree_headings,
             has_open_projects,
         };
     }
@@ -2126,7 +2141,7 @@ impl Sidebar {
         &'a self,
         multi_workspace: &'a MultiWorkspace,
     ) -> impl Iterator<Item = EntryShape> + 'a {
-        self.contents.entries.iter().map(move |entry| match entry {
+        self.contents.entries.iter().enumerate().map(move |(ix, entry)| match entry {
             ListEntry::ProjectHeader {
                 key, has_threads, ..
             } => EntryShape::ProjectHeader {
@@ -2137,8 +2152,14 @@ impl Sidebar {
                     .map(|state| !state.expanded)
                     .unwrap_or(false),
             },
-            ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
-            ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
+            ListEntry::Thread(thread) => EntryShape::Thread(
+                thread.metadata.thread_id,
+                self.contents.worktree_headings.contains_key(&ix),
+            ),
+            ListEntry::Terminal(terminal) => EntryShape::Terminal(
+                terminal.metadata.terminal_id,
+                self.contents.worktree_headings.contains_key(&ix),
+            ),
         })
     }
 
@@ -2291,6 +2312,14 @@ impl Sidebar {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
             }
         };
+        let rendered = match self.contents.worktree_headings.get(&ix) {
+            Some(heading) => v_flex()
+                .w_full()
+                .child(Self::render_worktree_heading(ix, heading))
+                .child(rendered)
+                .into_any_element(),
+            None => rendered,
+        };
 
         if is_group_header_after_first {
             v_flex()
@@ -2302,6 +2331,41 @@ impl Sidebar {
         } else {
             rendered
         }
+    }
+
+    /// A small label above the threads of one worktree: its name, then its
+    /// branch.
+    fn render_worktree_heading(ix: usize, heading: &WorktreeHeading) -> AnyElement {
+        h_flex()
+            .id(("worktree-heading", ix))
+            .w_full()
+            .min_w_0()
+            .pl_3()
+            .pr_2()
+            .pt_1p5()
+            .pb_0p5()
+            .gap_1()
+            .child(
+                Icon::new(IconName::GitWorktree)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(heading.name.clone())
+                    .size(LabelSize::XSmall)
+                    .weight(gpui::FontWeight::SEMIBOLD)
+                    .color(Color::Muted),
+            )
+            .when_some(heading.branch.clone(), |row, branch| {
+                row.child(
+                    Label::new(branch)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Placeholder)
+                        .truncate(),
+                )
+            })
+            .tooltip(Tooltip::text(heading.full_path.clone()))
+            .into_any_element()
     }
 
     fn render_remote_project_icon(
@@ -5826,12 +5890,17 @@ impl Sidebar {
         metadata.interacted_at.unwrap_or(metadata.updated_at)
     }
 
+    /// Pushes the rows of one project group, newest first. When the rows
+    /// come from more than one worktree, they are grouped by worktree: the
+    /// worktree with the newest row comes first, and the first row of each
+    /// worktree gets a heading.
     fn push_entries_by_display_time(
         entries: &mut Vec<ListEntry>,
         terminals: Vec<TerminalEntry>,
         threads: Vec<Arc<ThreadEntry>>,
         current_session_ids: &mut HashSet<acp::SessionId>,
         current_thread_ids: &mut HashSet<agent_ui::ThreadId>,
+        worktree_headings: &mut HashMap<usize, WorktreeHeading>,
     ) {
         fn display_time(entry: &ListEntry) -> DateTime<Utc> {
             match entry {
@@ -5844,20 +5913,59 @@ impl Sidebar {
             }
         }
 
-        let row_entries = terminals
+        fn heading(entry: &ListEntry) -> WorktreeHeading {
+            let worktrees = match entry {
+                ListEntry::Thread(thread) => thread.worktrees.as_slice(),
+                ListEntry::Terminal(terminal) => terminal.worktrees.as_slice(),
+                ListEntry::ProjectHeader { .. } => unreachable!(),
+            };
+            let join = |part: &dyn Fn(&ThreadItemWorktreeInfo) -> Option<SharedString>| {
+                let parts: Vec<SharedString> = worktrees.iter().filter_map(part).collect();
+                (!parts.is_empty()).then(|| SharedString::from(parts.join(", ")))
+            };
+            WorktreeHeading {
+                name: join(&|worktree| worktree.worktree_name.clone())
+                    .unwrap_or_else(|| "No worktree".into()),
+                branch: join(&|worktree| worktree.branch_name.clone()),
+                full_path: join(&|worktree| Some(worktree.full_path.clone())).unwrap_or_default(),
+            }
+        }
+
+        let row_entries: Vec<ListEntry> = terminals
             .into_iter()
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
-            .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
+            .sorted_by_key(|right| std::cmp::Reverse(display_time(right)))
+            .collect();
 
+        // Worktrees in order of their newest row. Rows keep their time order
+        // inside a worktree.
+        let mut groups: Vec<(WorktreeHeading, Vec<ListEntry>)> = Vec::new();
         for entry in row_entries {
-            if let ListEntry::Thread(thread) = &entry {
-                if let Some(session_id) = &thread.metadata.session_id {
-                    current_session_ids.insert(session_id.clone());
-                }
-                current_thread_ids.insert(thread.metadata.thread_id);
+            let key = heading(&entry);
+            match groups
+                .iter_mut()
+                .find(|(heading, _)| heading.full_path == key.full_path)
+            {
+                Some((_, rows)) => rows.push(entry),
+                None => groups.push((key, vec![entry])),
             }
-            entries.push(entry);
+        }
+        let show_headings = groups.len() > 1;
+
+        for (heading, rows) in groups {
+            if show_headings {
+                worktree_headings.insert(entries.len(), heading);
+            }
+            for entry in rows {
+                if let ListEntry::Thread(thread) = &entry {
+                    if let Some(session_id) = &thread.metadata.session_id {
+                        current_session_ids.insert(session_id.clone());
+                    }
+                    current_thread_ids.insert(thread.metadata.thread_id);
+                }
+                entries.push(entry);
+            }
         }
     }
 

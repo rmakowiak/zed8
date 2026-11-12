@@ -7547,6 +7547,110 @@ async fn test_two_worktree_workspaces_absorbed_when_main_added(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn test_threads_are_grouped_by_worktree(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    // Create the main repo directory (not opened as a workspace yet).
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+            },
+            "src": {},
+        }),
+    )
+    .await;
+
+    // Two worktree checkouts whose .git files point back to the main repo.
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: std::path::PathBuf::from("/wt-feature-a"),
+            ref_name: Some("refs/heads/feature-a".into()),
+            sha: "aaa".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: std::path::PathBuf::from("/wt-feature-b"),
+            ref_name: Some("refs/heads/feature-b".into()),
+            sha: "bbb".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project_a = project::Project::test(fs.clone(), ["/wt-feature-a".as_ref()], cx).await;
+    let project_b = project::Project::test(fs.clone(), ["/wt-feature-b".as_ref()], cx).await;
+
+    project_a.update(cx, |p, cx| p.git_scans_complete(cx)).await;
+    project_b.update(cx, |p, cx| p.git_scans_complete(cx)).await;
+
+    // Open both worktrees as workspaces — no main repo yet.
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(project_b.clone(), window, cx);
+    });
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let at = |second| chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, second).unwrap();
+    for (id, title, second, project) in [
+        ("a-old", "A old", 0, &project_a),
+        ("b", "B", 1, &project_b),
+        ("a-new", "A new", 2, &project_a),
+    ] {
+        save_thread_metadata(
+            acp::SessionId::new(Arc::from(id)),
+            Some(title.into()),
+            at(second),
+            None,
+            None,
+            project,
+            cx,
+        );
+    }
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    // The worktree with the newest thread comes first, and its threads stay together.
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            //
+            "v [project]",
+            "  A new {wt-feature-a}",
+            "  A old {wt-feature-a}",
+            "  B {wt-feature-b}",
+        ]
+    );
+    let headings = sidebar.read_with(cx, |sidebar, _| {
+        let mut headings: Vec<(usize, String)> = sidebar
+            .contents
+            .worktree_headings
+            .iter()
+            .map(|(ix, heading)| (*ix, heading.name.to_string()))
+            .collect();
+        headings.sort();
+        headings
+    });
+    assert_eq!(
+        headings,
+        vec![(1, "wt-feature-a".to_string()), (3, "wt-feature-b".to_string())]
+    );
+}
+
+#[gpui::test]
 async fn test_threadless_workspace_shows_new_thread_with_worktree_chip(cx: &mut TestAppContext) {
     // When a group has two workspaces — one with threads and one
     // without — the threadless workspace should appear as a

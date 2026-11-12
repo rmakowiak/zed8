@@ -65,7 +65,12 @@ fn send_review(
 
     // Look up the session before taking the comments, so nothing is lost
     // when no session is running.
-    let Some(session) = session::find_review_session(&paths::sessions_dir(), &roots) else {
+    // The session picked in the Review panel, else the newest one.
+    let session = workspace
+        .panel::<panel::ReviewPanel>(cx)
+        .and_then(|panel| panel.read(cx).session().cloned())
+        .or_else(|| session::find_review_sessions(&paths::sessions_dir(), &roots).into_iter().next());
+    let Some(session) = session else {
         show_toast(
             workspace,
             "No Plannotator review for this worktree. Ask Claude to start one.",

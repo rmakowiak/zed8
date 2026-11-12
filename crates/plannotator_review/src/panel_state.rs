@@ -1,5 +1,5 @@
 //! What the Review panel shows, loaded off the main thread: the branch, the
-//! PR, the review session, the spec reviews, the guide and its file stats.
+//! PR, the review sessions, the spec reviews, the guide and its file stats.
 
 use crate::{
     guide::{self, LoadedGuide},
@@ -19,7 +19,8 @@ const PR_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 pub struct PanelState {
     pub roots: Vec<PathBuf>,
     pub branch: Option<String>,
-    pub session: Option<Session>,
+    /// Live review sessions of the worktree, newest first.
+    pub sessions: Vec<Session>,
     pub guide: Option<LoadedGuide>,
     /// Git status and line counts of the guide's files, by path.
     pub file_stats: HashMap<String, FileStat>,
@@ -68,8 +69,10 @@ pub fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
     };
     let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
     let head = git(&["rev-parse", "HEAD"]);
-    let session = session::find_review_session(&crate::paths::sessions_dir(), &roots);
-    let specs = session::find_spec_sessions(&crate::paths::sessions_dir());
+    let mut sessions = session::find_review_sessions(&crate::paths::sessions_dir(), &roots);
+    let mut specs = session::find_spec_sessions(&crate::paths::sessions_dir());
+    session::add_ancestors(&mut sessions);
+    session::add_ancestors(&mut specs);
     let guide = guide::find_guide(&crate::paths::guides_dir(), branch.as_deref(), head.as_deref());
     let mut file_stats = HashMap::default();
     let base = guide
@@ -112,7 +115,7 @@ pub fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
     PanelState {
         roots,
         branch,
-        session,
+        sessions,
         guide,
         file_stats,
         specs,
