@@ -41,7 +41,7 @@ pub struct FileStat {
     pub removed: u32,
 }
 
-/// Tells the browser hook (`fork/plannotator-browser`) which worktrees this
+/// Tells the browser hook (`zed8/plannotator-browser`) which worktrees this
 /// window has open, so Plannotator sessions there stay in Zed.
 pub fn announce_roots(window_key: &str, roots: &[PathBuf]) {
     let dir = crate::paths::windows_dir();

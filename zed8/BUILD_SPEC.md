@@ -83,7 +83,7 @@ All five steps work, tested by hand on 2026-11-11 against PR #43508 and a test s
 - A new spec round on a file dismisses an earlier session of that file that still waits (`POST /api/exit`), so its Claude stops waiting.
 - The threads sidebar groups the rows of a project by worktree when they come from more than one worktree. The worktree with the newest thread comes first. This change is in `crates/sidebar/src/sidebar.rs` (`push_entries_by_display_time`, `render_worktree_heading`).
 - Plannotator keeps no record of earlier comments. Zed keeps the last sent round in `~/.plannotator/zed-drafts/` and compares it with the new text.
-- The browser fallback needs `PLANNOTATOR_BROWSER` set to `fork/plannotator-browser` (see "Turn on the browser hook").
+- The browser fallback needs `PLANNOTATOR_BROWSER` set to `zed8/plannotator-browser` (see "Turn on the browser hook").
 
 ## Fork changes to upstream files
 
@@ -107,11 +107,11 @@ The crate reads the Agent panel (`visible_terminal_view`), the terminal panel an
 
 ## Turn on the browser hook
 
-`fork/plannotator-browser` lets Zed take a Plannotator session. If no fork Zed has the session's worktree open, it opens the browser. To turn it on, set this in `~/.claude/settings.json`:
+`zed8/plannotator-browser` lets Zed take a Plannotator session. If no fork Zed has the session's worktree open, it opens the browser. To turn it on, set this in `~/.claude/settings.json`:
 
 ```json
 "env": {
-  "PLANNOTATOR_BROWSER": "/Users/rmakowiak-n8n/workspace/zed/fork/plannotator-browser",
+  "PLANNOTATOR_BROWSER": "/Users/rmakowiak-n8n/workspace/zed/zed8/plannotator-browser",
   "ZED_FALLBACK_BROWSER": "Google Chrome"
 }
 ```
@@ -124,7 +124,7 @@ Without it, Zed still shows spec and code review sessions, but the browser also 
 - cmake is in a private venv, linked to `~/.local/bin/cmake`.
 - Without Xcode, build with runtime shaders: `cargo build -p zed --features gpui_platform/runtime_shaders`.
 - The debug build is slow to use. For daily use, build `--profile release-fast` (optimized, no link-time optimization). The binary is `target/release-fast/zed`.
-- Start the fork with `fork/run.sh [worktree]`. It removes the `CLAUDE*` and `AI_AGENT` environment variables. If Claude Code starts the fork without the script, Claude Code in a fork terminal acts as a child session and does not save its transcript.
+- Start the fork with `zed8/run.sh [worktree]`. It removes the `CLAUDE*` and `AI_AGENT` environment variables. If Claude Code starts the fork without the script, Claude Code in a fork terminal acts as a child session and does not save its transcript.
 - The fork uses its own data folder: `--user-data-dir ~/workspace/zed-dev-data`. Its `config` folder is a copy of `~/.config/zed`, with `"feature_flags": {"diff-review": "on"}` added. The extensions and the Claude Code agent come from `~/Library/Application Support/Zed`.
 
 ## Todo

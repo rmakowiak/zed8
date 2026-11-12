@@ -27,7 +27,7 @@ pub fn unsent_dir() -> PathBuf {
     plannotator_dir().join("zed-unsent")
 }
 
-/// The worktrees of each Zed window, for `fork/plannotator-browser`.
+/// The worktrees of each Zed window, for `zed8/plannotator-browser`.
 pub fn windows_dir() -> PathBuf {
     plannotator_dir().join("zed-windows")
 }

@@ -33,6 +33,11 @@ impl FeatureFlag for DiffReviewFeatureFlag {
     const NAME: &'static str = "diff-review";
     type Value = PresenceFlag;
 
+    // zed8: the Plannotator review needs inline review comments everywhere.
+    fn enabled_for_all() -> bool {
+        true
+    }
+
     fn enabled_for_staff() -> bool {
         false
     }
