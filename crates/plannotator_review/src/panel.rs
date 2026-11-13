@@ -2,6 +2,7 @@
 //! reviewed ticks, the Plannotator session status, Approve and Send feedback.
 
 use crate::{
+    actions::{self, ReviewAction},
     chapter_view::{ChapterDiffView, ChapterIntro, ChapterKey, ChapterNavEvent},
     guide::{self, LoadedGuide},
     panel_state::{PanelState, announce_roots, load_state},
@@ -20,7 +21,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use file_icons::FileIcons;
 use ui::{
@@ -42,6 +43,8 @@ actions!(
 );
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a new thread may take before Claude runs in it.
+const CLAUDE_START_TIME: Duration = Duration::from_secs(20);
 #[derive(Clone)]
 struct SpecResult {
     target: String,
@@ -50,6 +53,16 @@ struct SpecResult {
     approved: bool,
     /// The local time of the send, such as `23:03`.
     at: String,
+}
+
+/// The state of a review action card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ActionStatus {
+    NotStarted,
+    Idle,
+    Working,
+    Waiting,
+    Done,
 }
 
 #[derive(Clone)]
@@ -80,6 +93,10 @@ pub struct ReviewPanel {
     /// The Claude terminal picked in the panel, for a worktree without a
     /// review session.
     chosen_thread: Option<EntityId>,
+    /// When each action was started from this panel. Claude takes a few
+    /// seconds to start in its new thread, and the card must not offer Start
+    /// again meanwhile.
+    started: HashMap<ReviewAction, Instant>,
     _spec_subscriptions: Vec<Subscription>,
     /// Rendered chapter overviews, by guide id and chapter.
     overviews: HashMap<(String, usize), Entity<Markdown>>,
@@ -167,6 +184,7 @@ impl ReviewPanel {
             code_sent: None,
             chosen_session: None,
             chosen_thread: None,
+            started: HashMap::default(),
             _spec_subscriptions: Vec::new(),
             _chapter_subscriptions: Vec::new(),
             _poll: poll,
@@ -485,7 +503,16 @@ impl ReviewPanel {
             .map(|spec| {
                 let target = spec.target.clone().unwrap_or_default();
                 let (name, dir) = name_and_dir(&target);
-                let thread = Self::render_thread_label(("spec-thread", spec.pid as usize), owner(spec).as_ref(), cx);
+                let owner = owner(spec);
+                let action = owner.as_ref().and_then(|owner| self.action_of(owner));
+                let (name, dir) = match (spec.mode.as_str(), action) {
+                    ("plan", Some(action)) => (format!("{} plan", action.title()), String::new()),
+                    ("plan", None) => ("Plan".to_string(), String::new()),
+                    (_, Some(action)) => (format!("{} · {name}", action.title()), dir),
+                    _ => (name, dir),
+                };
+                let waited = waited_label(&spec.started_at);
+                let thread = Self::render_thread_label(("spec-thread", spec.pid as usize), owner.as_ref(), cx);
                 let spec = spec.clone();
                 let row = h_flex()
                     .id(("spec", spec.pid as usize))
@@ -508,7 +535,7 @@ impl ReviewPanel {
                             .min_w_0()
                             .child(Label::new(dir).size(LabelSize::XSmall).color(Color::Muted).truncate_start()),
                     )
-                    .child(Label::new("your turn").size(LabelSize::XSmall).color(Color::Accent));
+                    .child(Label::new(waited).size(LabelSize::XSmall).color(Color::Warning));
                 v_flex().w_full().child(row).child(div().pl_6().child(thread)).into_any_element()
             })
             .collect();
@@ -558,7 +585,7 @@ impl ReviewPanel {
             );
         }
         Some(
-            Self::render_section("Spec review".to_string(), cx)
+            Self::render_section(format!("Needs you · {}", self.state.specs.len()), cx)
                 .child(v_flex().gap_0p5().children(rows))
                 .into_any_element(),
         )
@@ -581,6 +608,296 @@ impl ReviewPanel {
             }),
         ];
         cx.notify();
+    }
+
+    /// The review action whose thread is `terminal`.
+    fn action_of(&self, terminal: &start::ClaudeTerminal) -> Option<ReviewAction> {
+        let id = terminal.thread_id?.to_key_string();
+        ReviewAction::ALL
+            .into_iter()
+            .find(|action| self.state.actions.thread(*action) == Some(id.as_str()))
+    }
+
+    fn action_terminal(
+        &self,
+        action: ReviewAction,
+        terminals: &[start::ClaudeTerminal],
+    ) -> Option<start::ClaudeTerminal> {
+        let id = self.state.actions.thread(action)?;
+        terminals
+            .iter()
+            .find(|terminal| terminal.thread_id.is_some_and(|thread| thread.to_key_string() == id))
+            .cloned()
+    }
+
+    fn action_status(&self, action: ReviewAction, terminal: Option<&start::ClaudeTerminal>) -> ActionStatus {
+        if self.state.actions.thread(action).is_none() {
+            return ActionStatus::NotStarted;
+        }
+        let progress = self.state.progress.get(&action);
+        let owns_gate = terminal.is_some_and(|terminal| {
+            self.state.specs.iter().chain(&self.state.sessions).any(|session| terminal.owns(session))
+        });
+        if owns_gate || progress.is_some_and(|progress| progress.waiting) {
+            ActionStatus::Waiting
+        } else if progress.is_some_and(|progress| progress.done) {
+            ActionStatus::Done
+        } else if terminal.is_none()
+            && self.started.get(&action).is_some_and(|started| started.elapsed() < CLAUDE_START_TIME)
+        {
+            ActionStatus::Working
+        } else if terminal.is_none() {
+            // The thread was closed, or Claude in it quit, before the action finished.
+            ActionStatus::NotStarted
+        } else if terminal.is_some_and(|terminal| terminal.busy) {
+            ActionStatus::Working
+        } else {
+            ActionStatus::Idle
+        }
+    }
+
+    /// Starts the action in a new Claude thread with the action's name.
+    fn start_action(&mut self, action: ReviewAction, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.state.roots.first().cloned() else {
+            return;
+        };
+        let dir = crate::paths::actions_dir();
+        let progress_file = actions::progress_path(&dir, &root, action);
+        // A new run starts without the progress of the last one.
+        if let Err(error) = std::fs::remove_file(&progress_file)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!("plannotator: cannot reset {}: {error}", progress_file.display());
+        }
+        if let Some(parent) = progress_file.parent() {
+            std::fs::create_dir_all(parent).log_err();
+        }
+        let command = format!("claude {}", shell_quote(&action.command(&progress_file)));
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let thread = workspace.update(cx, |workspace, cx| {
+            let agent_panel = workspace.panel::<agent_ui::AgentPanel>(cx)?;
+            let thread = agent_panel.update(cx, |panel, cx| {
+                panel.new_named_terminal(action.title().into(), command, Some(root.clone()), window, cx)
+            })?;
+            workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
+            Some(thread)
+        });
+        let Some(thread) = thread else {
+            workspace.update(cx, |workspace, cx| {
+                crate::show_toast(workspace, "Zed cannot open a terminal thread in this project.", cx)
+            });
+            return;
+        };
+        self.started.insert(action, Instant::now());
+        self.state.actions.threads.insert(action.key().to_string(), thread.to_key_string());
+        actions::save_store(&dir, &root, &self.state.actions).log_err();
+        cx.notify();
+    }
+
+    fn set_hidden(&mut self, action: ReviewAction, hidden: bool, cx: &mut Context<Self>) {
+        let (Some(root), Some(pr)) = (self.state.roots.first().cloned(), self.state.pr.as_ref()) else {
+            return;
+        };
+        self.state.actions.set_hidden(action, pr.number, hidden);
+        actions::save_store(&crate::paths::actions_dir(), &root, &self.state.actions).log_err();
+        cx.notify();
+    }
+
+    fn render_actions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let terminals = self.claude_terminals(cx);
+        let pr = self.state.pr.as_ref().map(|pr| pr.number);
+        let mut cards = Vec::new();
+        let mut hidden = Vec::new();
+        for action in ReviewAction::ALL {
+            if self.state.actions.is_hidden(action, pr) {
+                hidden.push(action);
+                continue;
+            }
+            cards.push(self.render_action_card(action, &terminals, cx));
+        }
+        let hidden_rows = hidden.into_iter().map(|action| {
+            h_flex()
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .rounded_md()
+                .border_1()
+                .border_dashed()
+                .border_color(cx.theme().colors().border)
+                .child(Icon::new(IconName::EyeOff).size(IconSize::XSmall).color(Color::Muted))
+                .child(
+                    div().flex_1().child(
+                        Label::new(format!("{} is hidden for this PR", action.title()))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("show-{}", action.key())), "Show")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::XSmall)
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_hidden(action, false, cx))),
+                )
+                .into_any_element()
+        });
+        Self::render_section("Reviews".to_string(), cx)
+            .child(v_flex().gap_2().children(cards).children(hidden_rows))
+    }
+
+    fn render_action_card(
+        &self,
+        action: ReviewAction,
+        terminals: &[start::ClaudeTerminal],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let warning = cx.theme().status().warning;
+        let warning_border = cx.theme().status().warning_border;
+        let terminal = self.action_terminal(action, terminals);
+        let status = self.action_status(action, terminal.as_ref());
+        let progress = self.state.progress.get(&action);
+        let blocked = action.needs_pr() && self.state.pr.is_none();
+        let icon = match action {
+            ReviewAction::AgentReview => IconName::Sparkle,
+            ReviewAction::ManualTest => IconName::PlayFilled,
+            ReviewAction::GuidedReview => IconName::Book,
+        };
+        let summary = match (status, progress.and_then(|progress| progress.summary.clone())) {
+            (ActionStatus::NotStarted, _) if blocked => "Needs a PR".to_string(),
+            (ActionStatus::NotStarted, _) => action.description().to_string(),
+            (_, Some(summary)) => summary,
+            (ActionStatus::Waiting, None) => "Waits on you".to_string(),
+            (ActionStatus::Done, None) => "Done".to_string(),
+            (ActionStatus::Working, None) => "Claude is working".to_string(),
+            (_, None) => "Claude waits for the next step".to_string(),
+        };
+        let pill = match status {
+            ActionStatus::NotStarted => None,
+            ActionStatus::Idle => Some(("Idle", Color::Muted)),
+            ActionStatus::Working => Some(("Working", Color::Accent)),
+            ActionStatus::Waiting => Some(("Waiting on you", Color::Warning)),
+            ActionStatus::Done => Some(("Done", Color::Success)),
+        };
+        let key = action.key();
+        let header = h_flex()
+            .w_full()
+            .gap_2()
+            .child(
+                div()
+                    .size_7()
+                    .flex_none()
+                    .rounded_md()
+                    .bg(colors.element_background)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(icon).size(IconSize::Small).color(match status {
+                        ActionStatus::NotStarted => Color::Muted,
+                        ActionStatus::Done => Color::Success,
+                        _ => Color::Accent,
+                    })),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(action.title()).weight(FontWeight::SEMIBOLD))
+                    .child(Label::new(summary).size(LabelSize::XSmall).color(Color::Muted)),
+            )
+            .when_some(pill, |row, (text, color)| {
+                row.child(
+                    h_flex()
+                        .gap_1()
+                        .flex_none()
+                        .when(status == ActionStatus::Working, |pill| {
+                            pill.child(SpinnerLabel::new().size(LabelSize::XSmall).color(Color::Accent))
+                        })
+                        .when(status != ActionStatus::Working, |pill| {
+                            pill.child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(color))
+                        })
+                        .child(Label::new(text).size(LabelSize::XSmall).color(color)),
+                )
+            })
+            .when(status == ActionStatus::NotStarted || status == ActionStatus::Done, |row| {
+                let label = if status == ActionStatus::Done { "Run again" } else { "Start" };
+                row.child(
+                    Button::new(SharedString::from(format!("start-{key}")), label)
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .disabled(blocked)
+                        .tooltip(Tooltip::text(format!("Starts the Claude thread “{}”", action.title())))
+                        .on_click(cx.listener(move |this, _, window, cx| this.start_action(action, window, cx))),
+                )
+            })
+            .when(self.state.pr.is_some(), |row| {
+                row.child(
+                    IconButton::new(SharedString::from(format!("hide-{key}")), IconName::EyeOff)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Hide for this PR"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_hidden(action, true, cx))),
+                )
+            });
+
+        let steps: Vec<String> = match progress.filter(|progress| !progress.steps.is_empty()) {
+            Some(progress) => progress.steps.clone(),
+            None => action.default_steps().iter().map(|step| step.to_string()).collect(),
+        };
+        let current = progress.and_then(|progress| progress.step);
+        let detail = progress.and_then(|progress| progress.detail.clone());
+        let step_bar = (status != ActionStatus::NotStarted).then(|| {
+            h_flex().w_full().gap_1().children(steps.iter().enumerate().map(|(ix, step)| {
+                let done = status == ActionStatus::Done || current.is_some_and(|current| ix < current);
+                let is_current = status != ActionStatus::Done && current == Some(ix);
+                let bar = if done {
+                    colors.version_control_added
+                } else if is_current && status == ActionStatus::Waiting {
+                    warning
+                } else if is_current {
+                    colors.text_accent
+                } else {
+                    colors.border
+                };
+                let label = match (&detail, is_current) {
+                    (Some(detail), true) => detail.clone(),
+                    _ => step.clone(),
+                };
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(div().h(px(3.)).w_full().rounded_sm().bg(bar))
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::XSmall)
+                            .color(if is_current { Color::Default } else { Color::Muted })
+                            .truncate(),
+                    )
+            }))
+        });
+        let thread = terminal
+            .as_ref()
+            .map(|terminal| Self::render_thread_label(SharedString::from(format!("thread-{key}")), Some(terminal), cx));
+
+        v_flex()
+            .w_full()
+            .p_2()
+            .gap_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(if status == ActionStatus::Waiting {
+                warning_border
+            } else {
+                colors.border
+            })
+            .bg(colors.editor_background)
+            .child(header)
+            .children(step_bar)
+            .children(thread)
+            .into_any_element()
     }
 
     fn render_section(label: String, cx: &App) -> Div {
@@ -685,37 +1002,6 @@ impl ReviewPanel {
         let pr = self.state.pr.as_ref()?;
         let head = self.state.head.as_ref()?;
         (&pr.head_ref_oid != head).then(|| pr.head_ref_oid.clone())
-    }
-
-    /// The empty state: a "Review PR" button, or why there is none.
-    fn render_start(&self, cx: &App) -> impl IntoElement {
-        let section = Self::render_section("Chapters".to_string(), cx);
-        match &self.state.pr {
-            Some(pr) => section
-                .child(
-                    Label::new(format!("No guide yet for PR #{}: {}", pr.number, pr.title))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Button::new("review-pr", format!("Review PR #{}", pr.number))
-                        .style(ButtonStyle::Filled)
-                        .full_width()
-                        .on_click(|_, window, cx| window.dispatch_action(Box::new(start::ReviewPr), cx)),
-                )
-                .child(
-                    Label::new("Claude Code in a Zed terminal writes the guide.")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-            None => section
-                .child(Button::new("review-pr", "Review PR").full_width().disabled(true))
-                .child(
-                    Label::new("This branch has no open GitHub PR.")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-        }
     }
 
     fn render_session(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1167,6 +1453,24 @@ fn small_muted_markdown(window: &Window, cx: &App) -> MarkdownStyle {
     style
 }
 
+/// How long a session has waited, such as `12 min`, from its RFC 3339 start.
+fn waited_label(started_at: &str) -> String {
+    let Ok(started) = chrono::DateTime::parse_from_rfc3339(started_at) else {
+        return "waits".to_string();
+    };
+    let minutes = (chrono::Utc::now() - started.with_timezone(&chrono::Utc)).num_minutes().max(0);
+    match minutes {
+        0 => "now".to_string(),
+        1..=59 => format!("{minutes} min"),
+        _ => format!("{} h", minutes / 60),
+    }
+}
+
+/// `text` as one single-quoted shell word.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 fn relative_time(saved_at_ms: u64) -> String {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1194,26 +1498,29 @@ impl Render for ReviewPanel {
                 });
             }
         }
-        let body = match self.state.guide.clone() {
-            Some(guide) => self.render_chapters(&guide, window, cx).into_any_element(),
-            None => self.render_start(cx).into_any_element(),
-        };
+        let guided = self.state.guide.is_some() || !self.state.sessions.is_empty();
+        let body = self
+            .state
+            .guide
+            .clone()
+            .map(|guide| self.render_chapters(&guide, window, cx).into_any_element());
         v_flex()
             .key_context("PlannotatorReviewPanel")
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(self.render_header(cx))
-            .children(self.render_specs(cx))
-            .child(self.render_session(cx))
             .child(
                 v_flex()
                     .id("plannotator-review-body")
                     .flex_1()
                     .overflow_y_scroll()
-                    .child(body),
+                    .children(self.render_specs(cx))
+                    .child(self.render_actions(cx))
+                    .when(guided, |body| body.child(self.render_session(cx)))
+                    .children(body),
             )
-            .child(self.render_footer(cx))
+            .when(guided, |panel| panel.child(self.render_footer(cx)))
     }
 }
 

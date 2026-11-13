@@ -152,7 +152,7 @@ fn ancestors(parents: &HashMap<i32, i32>, pid: i32) -> Vec<i32> {
     result
 }
 
-/// Live annotate sessions on a markdown file, oldest first. A spec can live
+/// Live annotate sessions on a markdown file and plan mode sessions, oldest first. A spec can live
 /// anywhere (often in Claude's scratchpad), so there is no worktree filter.
 pub fn find_spec_sessions(dir: &Path) -> Vec<Session> {
     find_spec_sessions_with(dir, process_is_alive)
@@ -161,16 +161,25 @@ pub fn find_spec_sessions(dir: &Path) -> Vec<Session> {
 fn find_spec_sessions_with(dir: &Path, is_alive: impl Fn(i32) -> bool) -> Vec<Session> {
     let mut sessions: Vec<Session> = read_sessions(dir)
         .into_iter()
-        .filter(|session| session.mode == "annotate")
-        .filter(|session| {
-            session.target.as_deref().is_some_and(|target| {
+        .filter(|session| match session.mode.as_str() {
+            // Plan mode in Claude Code: the plan has no file of its own.
+            "plan" => true,
+            "annotate" => session.target.as_deref().is_some_and(|target| {
                 matches!(
                     Path::new(target).extension().and_then(|ext| ext.to_str()),
                     Some("md" | "mdx" | "markdown")
                 )
-            })
+            }),
+            _ => false,
         })
         .filter(|session| is_alive(session.pid))
+        .map(|mut session| {
+            // The target names the spec tab and keys its drafts.
+            if session.mode == "plan" && session.target.is_none() {
+                session.target = Some(format!("plan-{}.md", session.pid));
+            }
+            session
+        })
         .collect();
     sessions.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     sessions
@@ -302,5 +311,18 @@ mod tests {
         write(sessions.path(), 4, "review", docs.path(), "2026-01-04");
         let found = find_spec_sessions_with(sessions.path(), |pid| pid != 3);
         assert_eq!(found.iter().map(|session| session.pid).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn plan_mode_sessions_are_specs() {
+        let sessions = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sessions.path().join("8.json"),
+            r#"{"pid":8,"url":"http://localhost:1","mode":"plan","startedAt":"2026-01-05"}"#,
+        )
+        .unwrap();
+        let found = find_spec_sessions_with(sessions.path(), |_| true);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target.as_deref(), Some("plan-8.md"));
     }
 }

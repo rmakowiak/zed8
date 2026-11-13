@@ -5,6 +5,7 @@
 //! session (Claude Code in the terminal) receives them as review feedback.
 //! The Review panel shows the saved guide of the branch with its chapters.
 
+mod actions;
 mod chapter_view;
 mod client;
 mod feedback;

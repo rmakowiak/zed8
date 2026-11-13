@@ -1137,6 +1137,8 @@ pub struct AgentPanel {
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
+    /// Zed8: the init command of the next spawned terminal, in place of the setting.
+    next_init_command: Option<String>,
     #[cfg(test)]
     test_terminal_spawn_gate: Option<futures::channel::oneshot::Receiver<()>>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1558,6 +1560,7 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
+            next_init_command: None,
             #[cfg(test)]
             test_terminal_spawn_gate: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
@@ -2004,6 +2007,37 @@ impl AgentPanel {
         );
     }
 
+    /// Zed8: a new terminal thread with a name that runs `command`, such as
+    /// `claude "/pr-review"`. The Review panel starts its actions with it.
+    pub fn new_named_terminal(
+        &mut self,
+        title: SharedString,
+        command: String,
+        working_directory: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<TerminalId> {
+        if !self.supports_terminal(cx) {
+            return None;
+        }
+        let terminal_id = TerminalId::new();
+        self.next_init_command = Some(command);
+        self.spawn_terminal(
+            terminal_id,
+            working_directory,
+            Some(title),
+            None,
+            None,
+            true,
+            true,
+            true,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        Some(terminal_id)
+    }
+
     fn terminal_working_directory(
         &self,
         workspace: Option<&Workspace>,
@@ -2062,8 +2096,11 @@ impl AgentPanel {
         // as empty and spawning a second, "initial" terminal on activation.
         self.pending_terminal_spawn = Some(terminal_id);
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx)
-            .map(|command| Self::with_resume_session(command, terminal_id, cx));
+        let init_command = match self.next_init_command.take() {
+            Some(command) => Some(command),
+            None => Self::terminal_init_command(run_init_command, cx)
+                .map(|command| Self::with_resume_session(command, terminal_id, cx)),
+        };
         let terminal_task = self.create_terminal_shell(working_directory, cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;

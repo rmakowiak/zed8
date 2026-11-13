@@ -2,12 +2,13 @@
 //! PR, the review sessions, the spec reviews, the guide and its file stats.
 
 use crate::{
+    actions::{self, ActionProgress, ActionStore, ReviewAction},
     guide::{self, LoadedGuide},
     session::{self, Session},
     start::{self, PullRequest},
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -31,6 +32,10 @@ pub struct PanelState {
     /// The GitHub PR of the branch, from `gh`. See `PR_REFRESH_INTERVAL`.
     pub pr: Option<PullRequest>,
     pub pr_checked_at: Option<Instant>,
+    /// The threads and hidden actions of the worktree.
+    pub actions: ActionStore,
+    /// The progress that each started action reports.
+    pub progress: BTreeMap<ReviewAction, ActionProgress>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -113,7 +118,16 @@ pub fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
     } else {
         (root.as_deref().and_then(start::find_pull_request), Some(Instant::now()))
     };
+    let (actions, progress) = match root.as_deref() {
+        Some(root) => {
+            let dir = crate::paths::actions_dir();
+            (actions::load_store(&dir, root), actions::load_progress(&dir, root))
+        }
+        None => Default::default(),
+    };
     PanelState {
+        actions,
+        progress,
         roots,
         branch,
         sessions,

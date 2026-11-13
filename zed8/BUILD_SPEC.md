@@ -71,6 +71,32 @@ All five steps work, tested by hand on 2026-11-11 against PR #43508 and a test s
    - You comment on blocks and answer `:::question` blocks. Approve and Send feedback use Plannotator's export format.
    - A new round marks the changed blocks and shows the last round's comments as resolved or still open.
 
+## Review actions (round 2)
+
+Mockups: https://claude.ai/artifact/3xT22RtkpWWSdee7jQ6CSZ. The decisions come from a question round on 2026-11-13.
+
+The Review panel shows three review actions as cards: Agent review (`/pr-review`), Manual test (`/manual-test`) and Guided review (`/zed-guided-review`). Each one runs in its own Claude terminal thread with the name of the action. They can run at the same time.
+
+Decisions:
+
+- The panel starts each thread and keeps its terminal thread ID with the action, per worktree, in `~/.plannotator/zed-actions/<worktree>.json`.
+- Each skill writes its progress to `~/.plannotator/zed-actions/<worktree>/<action>.json`, in the format of `zed8/progress-format.md`. Zed passes the path with `--state`. The question round chose the review folder, but Zed picks the path so that the panel also works outside n8n.
+- Needs you lists only real gates: plans, charters, gate 2 findings, test results, and the Create PR confirm. Each row names its action or its thread, and shows how long it waited.
+- A hidden action stays hidden for this PR only.
+- Start runs each skill in the worktree of the window. `pr-review` does not create a second worktree then, so its sessions stay in this window.
+- A failed manual test case goes into the review body by default, never inline.
+- Create PR adds the flags picked before the PR as `flag:` labels.
+- Plan mode sessions of Claude Code (mode `plan`) count as specs.
+
+Build order:
+
+1. Panel overview: Needs you, the three cards with Start, step bars and hiding. Done on 2026-11-13, not tested by hand yet.
+2. The Manual test results tab, from `manual-test/results.json`.
+3. Gate 2 findings in Zed, from the Plannotator external annotations.
+4. Feature flags and the preview environment, as in the Raycast My Work extension.
+5. The screen for a branch without a PR, with Create PR.
+6. Status in the threads sidebar, a count on the dock icon, a toast in Zed, and a macOS notification when Zed is in the background. Zed opens a tab by itself only for the thread that you used last.
+
 ## Where the build differs from the decisions
 
 - Chapters open in their own diff tab, not inside the branch diff view. The branch diff has no hook for a file subset.
@@ -98,7 +124,7 @@ Keep this list short. Each item is a thin hook.
 - `crates/git_ui/src/branch_diff.rs`: `BranchDiff::editor` is public, not test-only.
 - `Cargo.toml`, `crates/zed/Cargo.toml`, `crates/zed/src/main.rs`: register the crate and call `plannotator_review::init`.
 
-The crate reads the Agent panel (`visible_terminal_view`), the terminal panel and the markdown crate through their public APIs, with no hooks.
+The crate reads the Agent panel (`visible_terminal_view`), the terminal panel and the markdown crate through their public APIs. It starts a named terminal thread with `AgentPanel::new_named_terminal`, which `zed8/UPSTREAM.md` lists.
 
 ## Crate layout
 
@@ -106,6 +132,7 @@ The crate reads the Agent panel (`visible_terminal_view`), the terminal panel an
 - `chapter_view.rs` and `note_thread.rs`: the chapter diff tab and the reply threads on Claude's notes.
 - `spec_view.rs`, `spec_doc.rs` and `spec_store.rs`: the spec review tab, the spec parser and export, and the drafts and rounds.
 - `start.rs`: "Review PR" and "Start session", which ask Claude Code.
+- `actions.rs`: the review actions, their threads, hidden actions and progress files.
 - `session.rs`, `guide.rs`, `client.rs`, `paths.rs`: Plannotator sessions, guides, HTTP and folders.
 - `feedback.rs`, `rich_text.rs`, `input.rs`: the code review export, markdown with mermaid, and the one-line input.
 

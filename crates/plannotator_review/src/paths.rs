@@ -36,3 +36,8 @@ pub fn windows_dir() -> PathBuf {
 pub fn claude_terminal_sessions_file() -> PathBuf {
     plannotator_dir().join("zed-claude-terminal-sessions.json")
 }
+
+/// The review actions of each worktree: their threads and their progress.
+pub fn actions_dir() -> PathBuf {
+    plannotator_dir().join("zed-actions")
+}
