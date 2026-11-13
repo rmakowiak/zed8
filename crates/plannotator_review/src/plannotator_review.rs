@@ -24,6 +24,7 @@ mod spec_doc;
 mod spec_store;
 mod spec_view;
 mod start;
+mod tools;
 
 use anyhow::Result;
 use editor::{Editor, ExportedReviewComment, actions::SendReviewToAgent};

@@ -86,6 +86,10 @@ pub struct ActionStore {
     /// Newer results go back into Needs you.
     #[serde(default)]
     pub seen_results: BTreeMap<String, String>,
+    /// Flags picked for a branch before its PR exists, by branch. Create PR
+    /// adds them as `flag:` labels.
+    #[serde(default)]
+    pub pending_flags: BTreeMap<String, Vec<String>>,
 }
 
 impl ActionStore {
@@ -131,6 +135,43 @@ pub struct ActionProgress {
     /// The action is finished.
     #[serde(default)]
     pub done: bool,
+}
+
+/// The thread key of Create PR in `ActionStore::threads`. It is not a card.
+pub const CREATE_PR_KEY: &str = "create-pr";
+
+/// The first prompt of the Create PR thread.
+pub fn create_pr_prompt(ticket: Option<&str>, flags: &[String]) -> String {
+    let mut prompt = String::from(
+        "Open a GitHub pull request for the branch that is checked out here. Push the branch first. \
+         Write the title and the body from the commits and the diff, and follow the PR rules of this repo.",
+    );
+    if let Some(ticket) = ticket {
+        prompt.push_str(&format!(" The Linear ticket is {ticket}: read it and link it in the body."));
+    }
+    if !flags.is_empty() {
+        let labels: Vec<String> = flags.iter().map(|flag| format!("flag:{flag}")).collect();
+        prompt.push_str(&format!(
+            " Add the labels {} when you open the PR, so the first preview has these flags.",
+            labels.join(", ")
+        ));
+    }
+    prompt.push_str(" Show me the title, the body and the labels, and wait for my yes before you open the PR.");
+    prompt
+}
+
+/// A Linear key in a branch name, such as `CONTEXT-433` in `context-433-skill-sync`.
+pub fn ticket_in_branch(branch: &str) -> Option<String> {
+    let parts: Vec<&str> = branch.rsplit('/').next()?.split('-').collect();
+    parts.windows(2).find_map(|pair| {
+        let (team, number) = (pair[0], pair[1]);
+        // Team keys such as CONTEXT have up to ten characters.
+        let team_ok = (2..=10).contains(&team.len())
+            && team.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && team.chars().all(|c| c.is_ascii_alphanumeric());
+        let number_ok = !number.is_empty() && number.len() <= 6 && number.chars().all(|c| c.is_ascii_digit());
+        (team_ok && number_ok).then(|| format!("{}-{number}", team.to_ascii_uppercase()))
+    })
 }
 
 /// The name of the review folder of a branch: `pr-<number>` with a PR, else
@@ -226,6 +267,14 @@ mod tests {
         assert_eq!(manual.step, Some(2));
         assert_eq!(manual.detail.as_deref(), Some("Run 3/8"));
         assert!(!progress.contains_key(&ReviewAction::AgentReview));
+    }
+
+    #[test]
+    fn finds_the_ticket_in_a_branch_name() {
+        assert_eq!(ticket_in_branch("context-433-skill-sync").as_deref(), Some("CONTEXT-433"));
+        assert_eq!(ticket_in_branch("roman/ado-12-fix").as_deref(), Some("ADO-12"));
+        assert_eq!(ticket_in_branch("fix-the-thing"), None);
+        assert!(create_pr_prompt(Some("CONTEXT-433"), &["a".into()]).contains("flag:a"));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 use crate::{
     actions::{self, ActionProgress, ActionStore, ReviewAction},
     manual_test_view::{self, ManualTestResults},
+    tools::{self, LocalN8n, PrTools},
     guide::{self, LoadedGuide},
     session::{self, Session},
     start::{self, PullRequest},
@@ -39,6 +40,12 @@ pub struct PanelState {
     pub progress: BTreeMap<ReviewAction, ActionProgress>,
     /// The `results.json` of the manual test of this branch, and its path.
     pub manual_results: Option<(PathBuf, ManualTestResults)>,
+    /// The labels and the preview of the PR. Refreshed with the PR.
+    pub tools: Option<PrTools>,
+    pub local_n8n: Option<LocalN8n>,
+    /// Without a PR: the commits ahead of the base and whether the branch
+    /// has an upstream.
+    pub branch_ahead: Option<(u32, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -116,11 +123,26 @@ pub fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
         && previous
             .pr_checked_at
             .is_some_and(|checked| checked.elapsed() < PR_REFRESH_INTERVAL);
-    let (pr, pr_checked_at) = if pr_is_fresh {
-        (previous.pr, previous.pr_checked_at)
+    let (pr, pr_checked_at, tools) = if pr_is_fresh {
+        (previous.pr, previous.pr_checked_at, previous.tools)
     } else {
-        (root.as_deref().and_then(start::find_pull_request), Some(Instant::now()))
+        let pr = root.as_deref().and_then(start::find_pull_request);
+        let tools = match (root.as_deref(), pr.as_ref()) {
+            (Some(root), Some(pr)) => tools::fetch_pr_tools(root, pr.number)
+                .map_err(|error| log::warn!("plannotator: no PR labels: {error:#}"))
+                .ok(),
+            _ => None,
+        };
+        (pr, Some(Instant::now()), tools)
     };
+    let local_n8n = root.as_deref().and_then(tools::local_n8n);
+    let branch_ahead = pr.is_none().then(|| {
+        let ahead = git(&["rev-list", "--count", "origin/master..HEAD"])
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0);
+        let pushed = git(&["rev-parse", "--abbrev-ref", "@{u}"]).is_some();
+        (ahead, pushed)
+    });
     let (actions, progress) = match root.as_deref() {
         Some(root) => {
             let dir = crate::paths::actions_dir();
@@ -132,6 +154,9 @@ pub fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
         .map(|target| crate::paths::reviews_dir().join(target).join("manual-test").join("results.json"))
         .and_then(|path| Some((path.clone(), manual_test_view::load_results(&path)?)));
     PanelState {
+        branch_ahead,
+        tools,
+        local_n8n,
         manual_results,
         actions,
         progress,

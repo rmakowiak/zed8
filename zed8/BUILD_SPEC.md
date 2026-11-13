@@ -93,8 +93,8 @@ Build order:
 1. Panel overview: Needs you, the three cards with Start, step bars and hiding. Done on 2026-11-13, not tested by hand yet.
 2. The Manual test results tab, from `manual-test/results.json`. Done on 2026-11-13: `manual_test_view.rs`. Every case with its proof: an image, a GIF with its frames, or a transcript. The Include box writes back into `results.json`.
 3. Gate 2 findings in Zed, from the Plannotator external annotations. Done on 2026-11-13: `findings.rs` and the findings mode of `chapter_view.rs`. The tab shows every changed file with each finding as a thread. Edit sends a PATCH to the session. Delete stays in Zed until you send. Approve and Send feedback post the message to `/api/feedback`.
-4. Feature flags and the preview environment, as in the Raycast My Work extension.
-5. The screen for a branch without a PR, with Create PR.
+4. Feature flags and the preview environment, as in the Raycast My Work extension. Done on 2026-11-13: `tools.rs` and the Tools section. `gh` reads the labels and the n8n-assistant preview comment every 60 seconds. The picker lists PostHog Staging flags when `POSTHOG_PERSONAL_API_KEY` is set, and the `flag:` labels of the repo. Apply asks first, then changes labels with `gh`. Local n8n reads its port from `../meta.json`.
+5. The screen for a branch without a PR, with Create PR. Done on 2026-11-13. Flags picked without a PR wait in the action store, and the Create PR thread gets them in its prompt.
 6. Status in the threads sidebar, a count on the dock icon, a toast in Zed, and a macOS notification when Zed is in the background. Zed opens a tab by itself only for the thread that you used last.
 
 ## Where the build differs from the decisions

@@ -5,6 +5,7 @@ use crate::{
     actions::{self, ReviewAction},
     chapter_view::{ChapterDiffView, ChapterIntro, ChapterKey, ChapterNavEvent},
     findings::{self, AnnotationsResponse},
+    tools::{self, FlagState, LabelChange},
     manual_test_view::ManualTestView,
     guide::{self, LoadedGuide},
     panel_state::{PanelState, announce_roots, load_state},
@@ -57,6 +58,20 @@ struct SpecResult {
     at: String,
 }
 
+/// The flag picker under Feature flags.
+struct FlagPicker {
+    /// Flags of PostHog Staging and the `flag:` labels of the repo.
+    options: Vec<String>,
+    loading: bool,
+    query: Entity<editor::Editor>,
+    /// The flag keys that the PR gets, with `=false` or `=<variant>` if any.
+    picked: Vec<String>,
+    /// The change waits for your yes, because it writes to GitHub.
+    confirm: Option<LabelChange>,
+    applying: bool,
+    _query_subscription: Subscription,
+}
+
 /// The state of a review action card.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ActionStatus {
@@ -99,6 +114,7 @@ pub struct ReviewPanel {
     /// seconds to start in its new thread, and the card must not offer Start
     /// again meanwhile.
     started: HashMap<ReviewAction, Instant>,
+    flag_picker: Option<FlagPicker>,
     _spec_subscriptions: Vec<Subscription>,
     /// Rendered chapter overviews, by guide id and chapter.
     overviews: HashMap<(String, usize), Entity<Markdown>>,
@@ -188,6 +204,7 @@ impl ReviewPanel {
             chosen_session: None,
             chosen_thread: None,
             started: HashMap::default(),
+            flag_picker: None,
             _spec_subscriptions: Vec::new(),
             _chapter_subscriptions: Vec::new(),
             _poll: poll,
@@ -1104,6 +1121,482 @@ impl ReviewPanel {
             .into_any_element()
     }
 
+    /// Opens the flag picker with the flags of the PR picked. `confirm`
+    /// shows the change at once, for a remove or a new preview.
+    fn open_flag_picker(&mut self, picked: Vec<String>, confirm: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.state.roots.first().cloned() else {
+            return;
+        };
+        let query = cx.new(|cx| {
+            let mut editor = editor::Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search PostHog Staging flags", window, cx);
+            editor
+        });
+        let subscription = cx.subscribe(&query, |_, _, event: &EditorEvent, cx| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                cx.notify();
+            }
+        });
+        let confirm = confirm
+            .then(|| self.state.tools.as_ref().map(|tools| tools.label_change(&picked)))
+            .flatten();
+        self.flag_picker = Some(FlagPicker {
+            options: Vec::new(),
+            loading: true,
+            query,
+            picked,
+            confirm,
+            applying: false,
+            _query_subscription: subscription,
+        });
+        cx.spawn(async move |this, cx| {
+            let options = cx.background_spawn(async move { tools::flag_options(&root) }).await;
+            this.update(cx, |this, cx| {
+                if let Some(picker) = this.flag_picker.as_mut() {
+                    picker.options = options;
+                    picker.loading = false;
+                }
+                cx.notify();
+            })
+        })
+        .detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    fn current_flags(&self) -> Vec<String> {
+        if self.state.pr.is_none() {
+            return self
+                .state
+                .branch
+                .as_ref()
+                .and_then(|branch| self.state.actions.pending_flags.get(branch))
+                .cloned()
+                .unwrap_or_default();
+        }
+        self.state
+            .tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .labels
+                    .iter()
+                    .filter_map(|label| label.strip_prefix("flag:").map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn toggle_flag(&mut self, flag: String, cx: &mut Context<Self>) {
+        if let Some(picker) = self.flag_picker.as_mut() {
+            let key = flag.split('=').next().unwrap_or(&flag).to_string();
+            let before = picker.picked.len();
+            picker.picked.retain(|picked| picked.split('=').next() != Some(key.as_str()));
+            if picker.picked.len() == before {
+                picker.picked.push(flag);
+            }
+            picker.confirm = None;
+            cx.notify();
+        }
+    }
+
+    /// The first click shows the change. The second writes the labels.
+    /// Without a PR, the flags wait in the store for Create PR.
+    fn apply_flags(&mut self, cx: &mut Context<Self>) {
+        if self.state.pr.is_none() {
+            let (Some(root), Some(branch), Some(picker)) =
+                (self.state.roots.first().cloned(), self.state.branch.clone(), self.flag_picker.take())
+            else {
+                return;
+            };
+            if picker.picked.is_empty() {
+                self.state.actions.pending_flags.remove(&branch);
+            } else {
+                self.state.actions.pending_flags.insert(branch, picker.picked);
+            }
+            actions::save_store(&crate::paths::actions_dir(), &root, &self.state.actions).log_err();
+            cx.notify();
+            return;
+        }
+        let (Some(root), Some(pr), Some(tools)) =
+            (self.state.roots.first().cloned(), self.state.pr.clone(), self.state.tools.clone())
+        else {
+            return;
+        };
+        let Some(picker) = self.flag_picker.as_mut() else {
+            return;
+        };
+        let Some(change) = picker.confirm.clone() else {
+            picker.confirm = Some(tools.label_change(&picker.picked));
+            cx.notify();
+            return;
+        };
+        if change.is_empty() {
+            self.flag_picker = None;
+            cx.notify();
+            return;
+        }
+        picker.applying = true;
+        let workspace = self.workspace.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { tools::apply_labels(&root, pr.number, &change) })
+                .await;
+            let message = match &result {
+                Ok(()) => format!("Labels changed on #{}. A running preview restarts in about 2 minutes.", pr.number),
+                Err(error) => format!("Labels not changed: {error:#}"),
+            };
+            this.update(cx, |this, cx| {
+                if result.is_ok() {
+                    this.flag_picker = None;
+                    // The next poll reads the labels again.
+                    this.state.pr_checked_at = None;
+                } else if let Some(picker) = this.flag_picker.as_mut() {
+                    picker.applying = false;
+                }
+                cx.notify();
+            })?;
+            workspace.update(cx, |workspace, cx| crate::show_toast(workspace, message, cx))
+        })
+        .detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    fn start_create_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(root), Some(branch)) = (self.state.roots.first().cloned(), self.state.branch.clone()) else {
+            return;
+        };
+        let flags = self.state.actions.pending_flags.get(&branch).cloned().unwrap_or_default();
+        let ticket = actions::ticket_in_branch(&branch);
+        let command = format!("claude {}", shell_quote(&actions::create_pr_prompt(ticket.as_deref(), &flags)));
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let thread = workspace.update(cx, |workspace, cx| {
+            let agent_panel = workspace.panel::<agent_ui::AgentPanel>(cx)?;
+            let thread = agent_panel.update(cx, |panel, cx| {
+                panel.new_named_terminal("Create PR".into(), command, Some(root.clone()), window, cx)
+            })?;
+            workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
+            Some(thread)
+        });
+        if let Some(thread) = thread {
+            self.state.actions.threads.insert(actions::CREATE_PR_KEY.to_string(), thread.to_key_string());
+            actions::save_store(&crate::paths::actions_dir(), &root, &self.state.actions).log_err();
+            cx.notify();
+        }
+    }
+
+    /// Instead of the PR: the branch, and a Create PR button that starts a
+    /// Claude thread with that name.
+    fn render_no_pr(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let branch = self.state.branch.clone()?;
+        if self.state.pr.is_some() || matches!(branch.as_str(), "HEAD" | "main" | "master") {
+            return None;
+        }
+        let colors = cx.theme().colors().clone();
+        let (ahead, pushed) = self.state.branch_ahead.unwrap_or((0, false));
+        let ticket = actions::ticket_in_branch(&branch);
+        let terminals = self.claude_terminals(cx);
+        let thread = self.state.actions.threads.get(actions::CREATE_PR_KEY).and_then(|id| {
+            terminals
+                .iter()
+                .find(|terminal| terminal.thread_id.is_some_and(|thread| thread.to_key_string() == *id))
+                .cloned()
+        });
+        let mut meta = format!("{ahead} commits ahead of master");
+        meta.push_str(if pushed { " · pushed" } else { " · not pushed" });
+        if let Some(ticket) = &ticket {
+            meta.push_str(&format!(" · {ticket}"));
+        }
+        Some(
+            v_flex()
+                .m_3()
+                .p_3()
+                .gap_2()
+                .items_center()
+                .rounded_md()
+                .border_1()
+                .border_dashed()
+                .border_color(colors.border)
+                .child(Icon::new(IconName::GitBranch).size(IconSize::Medium).color(Color::Muted))
+                .child(Label::new("No pull request for this branch").weight(FontWeight::SEMIBOLD))
+                .child(
+                    Label::new("Agent review and Guided review need a PR on GitHub. Manual test runs on the local branch.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .p_1p5()
+                        .rounded_sm()
+                        .bg(colors.element_background)
+                        .child(Label::new(branch).size(LabelSize::Small).buffer_font(cx))
+                        .child(Label::new(meta).size(LabelSize::XSmall).color(Color::Muted)),
+                )
+                .map(|card| match thread {
+                    Some(thread) => card.child(Self::render_thread_label("create-pr-thread", Some(&thread), cx)),
+                    None => card.child(
+                        Button::new("create-pr", "Create PR")
+                            .style(ButtonStyle::Filled)
+                            .tooltip(Tooltip::text("Starts the Claude thread “Create PR”. It asks before it opens the PR."))
+                            .on_click(cx.listener(|this, _, window, cx| this.start_create_pr(window, cx))),
+                    ),
+                }),
+        )
+    }
+
+    fn render_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let tools = self.state.tools.clone();
+        let has_pr = self.state.pr.is_some();
+        let tool_row = |icon: IconName, name: &str, state: String, color: Color| {
+            h_flex()
+                .w_full()
+                .gap_2()
+                .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Label::new(name.to_string()).size(LabelSize::Small))
+                        .child(Label::new(state).size(LabelSize::XSmall).color(color).truncate()),
+                )
+        };
+
+        let preview = tools.as_ref().and_then(|tools| tools.preview.clone());
+        let deploying = tools.as_ref().is_some_and(|tools| tools.has_preview()) && preview.is_none();
+        let preview_row = tool_row(
+            IconName::Public,
+            "Preview env",
+            match (&preview, deploying, has_pr) {
+                (Some(preview), _, _) => format!("Live · {}", preview.url),
+                (None, true, _) => "Deploying".to_string(),
+                (None, false, true) => "Not deployed".to_string(),
+                (None, false, false) => "Needs a PR".to_string(),
+            },
+            if preview.is_some() { Color::Success } else if deploying { Color::Accent } else { Color::Muted },
+        )
+        .map(|row| match preview.clone() {
+            Some(preview) => row.child(
+                Button::new("open-preview", "Open")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .on_click(move |_, _, cx| cx.open_url(&preview.url)),
+            ),
+            None if !deploying => row.child(
+                Button::new("create-preview", "Create")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .disabled(!has_pr || tools.is_none())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let picked = this.current_flags();
+                        this.open_flag_picker(picked, true, window, cx)
+                    })),
+            ),
+            None => row,
+        });
+
+        let flags = tools.as_ref().map(|tools| tools.flag_labels()).unwrap_or_default();
+        let pending = if has_pr { Vec::new() } else { self.current_flags() };
+        let flags_row = tool_row(
+            IconName::Settings,
+            "Feature flags",
+            match (has_pr, flags.is_empty(), pending.is_empty()) {
+                (false, _, true) => "Pick flags now. Create PR adds them as labels.".to_string(),
+                (false, _, false) => format!("For Create PR: {}", pending.join(", ")),
+                (true, true, _) => "No flag: labels on the PR".to_string(),
+                (true, false, _) => "PR labels · PostHog Staging".to_string(),
+            },
+            Color::Muted,
+        )
+        .when(self.flag_picker.is_none(), |row| {
+            row.child(
+                Button::new("edit-flags", "Edit")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .disabled(has_pr && tools.is_none())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let picked = this.current_flags();
+                        this.open_flag_picker(picked, false, window, cx)
+                    })),
+            )
+        });
+        let flag_rows = flags.into_iter().map(|(label, state)| {
+            let (text, color) = match state {
+                FlagState::InPreview => ("on in preview", Color::Success),
+                FlagState::Pending => ("restarts, ~2 min", Color::Accent),
+                FlagState::NoPreview => ("no preview yet", Color::Muted),
+            };
+            let key = label.strip_prefix("flag:").unwrap_or(&label).to_string();
+            h_flex()
+                .w_full()
+                .pl_6()
+                .gap_2()
+                .child(div().flex_1().min_w_0().child(Label::new(label.clone()).size(LabelSize::XSmall).buffer_font(cx).truncate()))
+                .child(Label::new(text).size(LabelSize::XSmall).color(color))
+                .child(
+                    IconButton::new(SharedString::from(format!("remove-{label}")), IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(format!("Remove the label {label}")))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let picked: Vec<String> =
+                                this.current_flags().into_iter().filter(|flag| *flag != key).collect();
+                            this.open_flag_picker(picked, true, window, cx)
+                        })),
+                )
+                .into_any_element()
+        });
+
+        let local = self.state.local_n8n.clone();
+        let local_row = local.map(|local| {
+            tool_row(
+                IconName::Terminal,
+                "Local n8n",
+                if local.running {
+                    format!("Running on port {}", local.port)
+                } else {
+                    format!("Stopped · port {}", local.port)
+                },
+                if local.running { Color::Accent } else { Color::Muted },
+            )
+            .when(local.running, |row| {
+                let url = format!("http://localhost:{}", local.port);
+                row.child(
+                    Button::new("open-local-n8n", "Open")
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+            })
+        });
+
+        Self::render_section("Tools".to_string(), cx).child(
+            v_flex()
+                .w_full()
+                .p_2()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border_variant)
+                .child(preview_row)
+                .child(flags_row)
+                .children(flag_rows)
+                .children(self.render_flag_picker(cx))
+                .children(local_row),
+        )
+    }
+
+    fn render_flag_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let picker = self.flag_picker.as_ref()?;
+        let colors = cx.theme().colors().clone();
+        let query = picker.query.read(cx).text(cx).trim().to_lowercase();
+        let picked_keys: Vec<&str> = picker.picked.iter().map(|flag| flag.split('=').next().unwrap_or(flag)).collect();
+        let mut shown: Vec<String> = picker.picked.clone();
+        shown.extend(
+            picker
+                .options
+                .iter()
+                .filter(|option| !picked_keys.contains(&option.as_str()))
+                .filter(|option| query.is_empty() || option.to_lowercase().contains(&query))
+                .take(12)
+                .cloned(),
+        );
+        // A key that is not in PostHog can be typed in, with `=false` or `=<variant>`.
+        let typed = (!query.is_empty() && !shown.iter().any(|flag| flag.to_lowercase() == query))
+            .then(|| picker.query.read(cx).text(cx).trim().to_string());
+        let rows = shown.into_iter().chain(typed).map(|flag| {
+            let key = flag.split('=').next().unwrap_or(&flag).to_string();
+            let on = picked_keys.contains(&key.as_str());
+            h_flex()
+                .gap_1p5()
+                .child(
+                    Checkbox::new(SharedString::from(format!("flag-{flag}")), if on { ToggleState::Selected } else { ToggleState::Unselected })
+                        .on_click(cx.listener({
+                            let flag = flag.clone();
+                            move |this, _, _, cx| this.toggle_flag(flag.clone(), cx)
+                        })),
+                )
+                .child(Label::new(flag).size(LabelSize::XSmall).buffer_font(cx))
+                .into_any_element()
+        });
+        let confirm = picker.confirm.clone();
+        let confirm_text = confirm.as_ref().map(|change| {
+            if change.is_empty() {
+                "Nothing to change.".to_string()
+            } else {
+                let mut parts = Vec::new();
+                if !change.add.is_empty() {
+                    parts.push(format!("Add {}.", change.add.join(", ")));
+                }
+                if !change.remove.is_empty() {
+                    parts.push(format!("Remove {}.", change.remove.join(", ")));
+                }
+                parts.push("The preview restarts with the new flags in about 2 minutes.".to_string());
+                parts.join(" ")
+            }
+        });
+        Some(
+            v_flex()
+                .w_full()
+                .p_2()
+                .gap_1p5()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.editor_background)
+                .child(
+                    div()
+                        .px_1()
+                        .py_0p5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(colors.border_focused)
+                        .child(picker.query.clone()),
+                )
+                .when(picker.loading, |list| {
+                    list.child(Label::new("Loading flags…").size(LabelSize::XSmall).color(Color::Muted))
+                })
+                .children(rows)
+                .child(
+                    Label::new("Newest first, disabled flags too. Type key=false or key=variant by hand.")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .when_some(confirm_text, |list, text| {
+                    list.child(
+                        div()
+                            .p_1p5()
+                            .rounded_sm()
+                            .bg(colors.element_selected)
+                            .child(Label::new(text).size(LabelSize::XSmall)),
+                    )
+                })
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new("apply-flags", if confirm.is_some() { "Apply labels" } else { "Review change" })
+                                .style(ButtonStyle::Filled)
+                                .label_size(LabelSize::Small)
+                                .disabled(picker.applying)
+                                .on_click(cx.listener(|this, _, _, cx| this.apply_flags(cx))),
+                        )
+                        .child(
+                            Button::new("cancel-flags", "Cancel")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.flag_picker = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_section(label: String, cx: &App) -> Div {
         v_flex()
             .w_full()
@@ -1720,7 +2213,9 @@ impl Render for ReviewPanel {
                     .flex_1()
                     .overflow_y_scroll()
                     .children(self.render_specs(cx))
+                    .children(self.render_no_pr(cx))
                     .child(self.render_actions(cx))
+                    .child(self.render_tools(cx))
                     .when(guided, |body| body.child(self.render_session(cx)))
                     .children(body),
             )
