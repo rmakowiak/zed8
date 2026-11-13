@@ -72,6 +72,25 @@ struct FlagPicker {
     _query_subscription: Subscription,
 }
 
+/// Something that a Claude thread waits on you for.
+#[derive(Clone)]
+struct Gate {
+    /// Stays the same while the gate waits, so each gate notifies once.
+    key: String,
+    /// The terminal thread that waits.
+    owner: Option<agent_ui::TerminalId>,
+    message: String,
+    kind: GateKind,
+}
+
+#[derive(Clone)]
+enum GateKind {
+    Spec(Session),
+    Findings(Session),
+    Results,
+    Question,
+}
+
 /// The state of a review action card.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ActionStatus {
@@ -115,6 +134,9 @@ pub struct ReviewPanel {
     /// again meanwhile.
     started: HashMap<ReviewAction, Instant>,
     flag_picker: Option<FlagPicker>,
+    /// The gates that already notified or opened.
+    known_gates: HashSet<String>,
+    handled_first_gates: bool,
     _spec_subscriptions: Vec<Subscription>,
     /// Rendered chapter overviews, by guide id and chapter.
     overviews: HashMap<(String, usize), Entity<Markdown>>,
@@ -147,17 +169,10 @@ impl ReviewPanel {
                         load_state(roots, previous)
                     }})
                     .await;
-                let Ok((reveal, new_specs, workspace)) = this.update(cx, |this, cx| {
+                let Ok((reveal, workspace)) = this.update(cx, |this, cx| {
                     // A new guide or a new session means Claude just started a review.
                     let guide_id = |state: &PanelState| state.guide.as_ref().map(|guide| guide.id.clone());
                     let session_pid = |state: &PanelState| state.sessions.first().map(|session| session.pid);
-                    // On the first load too: a spec that waits when Zed starts opens.
-                    let new_specs: Vec<Session> = state
-                        .specs
-                        .iter()
-                        .filter(|spec| !this.state.specs.iter().any(|old| old.pid == spec.pid))
-                        .cloned()
-                        .collect();
                     // A new spec review opens only its tab: the panel adds nothing to it.
                     let reveal = !first_load
                         && ((guide_id(&state).is_some() && guide_id(&state) != guide_id(&this.state))
@@ -168,7 +183,7 @@ impl ReviewPanel {
                     this.state = state;
                     // Also follows Claude's working state, which lives in a terminal title.
                     cx.notify();
-                    (reveal, new_specs, this.workspace.clone())
+                    (reveal, this.workspace.clone())
                 }) else {
                     return;
                 };
@@ -182,10 +197,7 @@ impl ReviewPanel {
                         .log_err();
                 }
                 this.update(cx, |this, cx| this.refresh_results_tab(cx)).log_err();
-                for spec in new_specs {
-                    this.update_in(cx, |this, window, cx| this.open_spec(spec, false, window, cx))
-                        .log_err();
-                }
+                this.update_in(cx, |this, window, cx| this.handle_new_gates(window, cx)).log_err();
                 cx.background_executor().timer(POLL_INTERVAL).await;
             }
         });
@@ -205,6 +217,8 @@ impl ReviewPanel {
             chosen_thread: None,
             started: HashMap::default(),
             flag_picker: None,
+            known_gates: HashSet::default(),
+            handled_first_gates: false,
             _spec_subscriptions: Vec::new(),
             _chapter_subscriptions: Vec::new(),
             _poll: poll,
@@ -775,6 +789,93 @@ impl ReviewPanel {
         self.state.actions.threads.insert(action.key().to_string(), thread.to_key_string());
         actions::save_store(&dir, &root, &self.state.actions).log_err();
         cx.notify();
+    }
+
+    /// Everything that waits on you, with the thread that waits.
+    fn gates(&self, cx: &App) -> Vec<Gate> {
+        let terminals = self.claude_terminals(cx);
+        let owner_of = |session: &Session| {
+            terminals.iter().find(|terminal| terminal.owns(session)).and_then(|terminal| terminal.thread_id)
+        };
+        let title_of = |session: &Session| {
+            terminals
+                .iter()
+                .find(|terminal| terminal.owns(session))
+                .map(|terminal| terminal.title.clone())
+                .unwrap_or_else(|| "Claude".to_string())
+        };
+        let mut gates: Vec<Gate> = self
+            .state
+            .specs
+            .iter()
+            .map(|spec| Gate {
+                key: format!("spec:{}", spec.pid),
+                owner: owner_of(spec),
+                message: format!("{} waits on you: {}", title_of(spec), if spec.mode == "plan" { "a plan" } else { "a spec" }),
+                kind: GateKind::Spec(spec.clone()),
+            })
+            .collect();
+        if let Some(session) = self.findings_session(&terminals) {
+            gates.push(Gate {
+                key: format!("findings:{}", session.pid),
+                owner: owner_of(&session),
+                message: "Agent review waits on you: the findings".to_string(),
+                kind: GateKind::Findings(session),
+            });
+        }
+        if let (Some((total, failed)), Some((_, results))) = (self.unseen_results(), &self.state.manual_results) {
+            gates.push(Gate {
+                key: format!("results:{}:{}", results.target, results.ended_at),
+                owner: self.action_terminal(ReviewAction::ManualTest, &terminals).and_then(|terminal| terminal.thread_id),
+                message: format!("Manual test is done: {failed} of {total} failed"),
+                kind: GateKind::Results,
+            });
+        }
+        for (action, progress) in &self.state.progress {
+            if progress.waiting {
+                gates.push(Gate {
+                    key: format!("question:{}:{}", action.key(), progress.summary.clone().unwrap_or_default()),
+                    owner: self.action_terminal(*action, &terminals).and_then(|terminal| terminal.thread_id),
+                    message: format!("{} waits on you in its thread", action.title()),
+                    kind: GateKind::Question,
+                });
+            }
+        }
+        gates
+    }
+
+    /// A new gate of the thread that you use now opens its tab. Any other
+    /// new gate marks its thread in the threads sidebar, pops up when Zed is
+    /// in the background, and shows a toast. Gates that wait when Zed starts
+    /// only show in Needs you.
+    fn handle_new_gates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let gates = self.gates(cx);
+        let first = !self.handled_first_gates;
+        self.handled_first_gates = true;
+        let new: Vec<Gate> = gates.iter().filter(|gate| !self.known_gates.contains(&gate.key)).cloned().collect();
+        self.known_gates = gates.into_iter().map(|gate| gate.key).collect();
+        if first {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let agent_panel = workspace.read(cx).panel::<agent_ui::AgentPanel>(cx);
+        let active = agent_panel.as_ref().and_then(|panel| panel.read(cx).active_terminal_id());
+        for gate in new {
+            let yours = gate.owner.is_some() && gate.owner == active;
+            match (&gate.kind, yours || gate.owner.is_none()) {
+                (GateKind::Spec(spec), true) => self.open_spec(spec.clone(), false, window, cx),
+                (GateKind::Findings(session), true) if yours => self.open_findings(session.clone(), window, cx),
+                _ => {
+                    if let (Some(owner), Some(agent_panel)) = (gate.owner, agent_panel.as_ref()) {
+                        agent_panel.update(cx, |panel, cx| panel.notify_terminal(owner, window, cx));
+                    }
+                    let message = gate.message.clone();
+                    workspace.update(cx, |workspace, cx| crate::show_toast(workspace, message, cx));
+                }
+            }
+        }
     }
 
     /// The gate 2 session of the agent review: a code review session that
@@ -2262,7 +2363,13 @@ impl Panel for ReviewPanel {
     }
 
     fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
-        Some("Plannotator Review")
+        Some("Review")
+    }
+
+    /// The count of what waits on you, on the dock button.
+    fn icon_label(&self, _: &Window, cx: &App) -> Option<String> {
+        let count = self.gates(cx).len();
+        (count > 0).then(|| count.to_string())
     }
 
     fn toggle_action(&self) -> Box<dyn Action> {

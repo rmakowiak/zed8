@@ -180,7 +180,7 @@ pub fn fetch_pr_tools(root: &Path, pr: u64) -> Result<PrTools> {
         .iter()
         .filter(|comment| comment.author.as_ref().is_some_and(|author| author.login.starts_with("n8n-assistant")))
         .filter_map(|comment| parse_preview(&comment.body))
-        .last();
+        .next_back();
     Ok(PrTools {
         labels: pr.labels.into_iter().map(|label| label.name).collect(),
         preview,
@@ -264,7 +264,7 @@ fn posthog_staging_flags() -> Result<Vec<String>> {
         flags.extend(page.results.into_iter().filter(|flag| !flag.deleted).map(|flag| flag.key));
         url = page.next;
     }
-    flags.sort_by(|a, b| natural_key(b).cmp(&natural_key(a)));
+    flags.sort_by_key(|flag| std::cmp::Reverse(natural_key(flag)));
     Ok(flags)
 }
 
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn newest_flag_numbers_come_first() {
         let mut keys = vec!["99_x", "136_skill_sync", "mcp"];
-        keys.sort_by(|a, b| natural_key(b).cmp(&natural_key(a)));
+        keys.sort_by_key(|key| std::cmp::Reverse(natural_key(key)));
         assert_eq!(keys, vec!["136_skill_sync", "99_x", "mcp"]);
     }
 }

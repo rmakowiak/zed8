@@ -2696,6 +2696,12 @@ impl AgentPanel {
         }
     }
 
+    /// Zed8: marks a terminal thread as waiting, as its bell does: a dot in
+    /// the threads sidebar, a sound, and a pop-up when the thread is not in view.
+    pub fn notify_terminal(&mut self, terminal_id: TerminalId, window: &mut Window, cx: &mut Context<Self>) {
+        self.mark_terminal_notification(terminal_id, window, cx);
+    }
+
     fn mark_terminal_notification(
         &mut self,
         terminal_id: TerminalId,

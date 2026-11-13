@@ -25,6 +25,7 @@ upstream file, add a row here in the same commit.
 | `crates/agent_ui/src/agent_panel.rs` | `TerminalResumeSession`, `with_resume_session` in `spawn_terminal`, and `TerminalId::to_key_string` and `from_key_string` are public | A restored terminal thread runs `claude --resume <session>`. The crate records the sessions. |
 | `crates/agent_ui/src/agent_ui.rs` | `TerminalResumeSession` in the `pub use crate::agent_panel::{...}` list | The crate sets the hook. |
 | `crates/agent_ui/src/agent_panel.rs` | `AgentPanel::new_named_terminal` and the `next_init_command` field, read in `spawn_terminal` | The Review panel starts each review action in a terminal thread with its name and its first prompt. |
+| `crates/agent_ui/src/agent_panel.rs` | `AgentPanel::notify_terminal`, which calls `mark_terminal_notification` | A thread that waits on you gets the dot in the threads sidebar, the sound and the pop-up of a terminal bell. |
 | `crates/sidebar/src/sidebar.rs` | Worktree groups. See the list under the table. | The threads sidebar groups threads by worktree. This is the largest change to upstream code. |
 | `crates/sidebar/src/sidebar_tests.rs` | `test_threads_are_grouped_by_worktree` | Tests the grouping. |
 
