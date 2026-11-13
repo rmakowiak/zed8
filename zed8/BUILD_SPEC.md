@@ -80,6 +80,10 @@ All five steps work, tested by hand on 2026-11-11 against PR #43508 and a test s
 - Plannotator sessions do not record which thread started them. Zed finds the thread from the process tree: the Plannotator server runs below the Claude process of a terminal.
 - Several review sessions on one worktree: the panel lists each session with its thread, and you pick the one that gets Send feedback and Approve. Without a pick, the newest session gets them.
 - "Review PR" and "Start session" go to the thread of the picked session. Without a session, the panel lists the Claude threads and you pick one.
+- A spec review shows only in a window that has its worktree open: the worktree holds the spec file, or the Claude process behind the session runs in it. Zed reads the folder of each parent process of the Plannotator server. The browser hook uses the same rule, so a spec from a worktree that no Zed window has open goes to the browser.
+- A new spec review opens its tab only. The Review panel stays closed, because it adds nothing to a spec review.
+- Approve on a spec sends the answers and comments with the approval, in the same format as Send feedback. The Plannotator approve route accepts them.
+- Spec comments and their input use the layout of the diff review comments: the avatar, a row on the surface color, and Close and Add buttons.
 - A new spec round on a file dismisses an earlier session of that file that still waits (`POST /api/exit`), so its Claude stops waiting.
 - The threads sidebar groups the rows of a project by worktree when they come from more than one worktree. The worktree with the newest thread comes first. This change is in `crates/sidebar/src/sidebar.rs` (`push_entries_by_display_time`, `render_worktree_heading`).
 - Plannotator keeps no record of earlier comments. Zed keeps the last sent round in `~/.plannotator/zed-drafts/` and compares it with the new text.

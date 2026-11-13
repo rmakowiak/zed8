@@ -15,7 +15,7 @@ use crate::{
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, Render, SharedString, Subscription, Task, Window, px,
+    IntoElement, Render, SharedString, SharedUri, Subscription, Task, Window, px,
 };
 use http_client::{HttpClient, Method};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -26,7 +26,7 @@ use std::{
     sync::Arc,
 };
 use theme::ThemeColors;
-use ui::{SpinnerLabel, TintColor, Tooltip, prelude::*};
+use ui::{Avatar, SpinnerLabel, TintColor, Tooltip, prelude::*};
 use workspace::{Item, item::ItemEvent};
 
 pub enum SpecViewEvent {
@@ -95,6 +95,8 @@ pub struct SpecReviewView {
     record: SpecRecord,
     /// The block that has the comment input open.
     comment_input: Option<(usize, Entity<Editor>)>,
+    /// The avatar of the signed-in user, as on diff review comments.
+    avatar: Option<SharedUri>,
     /// Questions whose note field is open.
     notes_open: HashSet<String>,
     /// What went to Claude, shown while Claude works on the next round.
@@ -107,6 +109,7 @@ impl SpecReviewView {
     pub fn new(
         session: Session,
         http: Arc<dyn HttpClient>,
+        avatar: Option<SharedUri>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -136,6 +139,7 @@ impl SpecReviewView {
             record: spec_store::load(&record_path),
             record_path,
             comment_input: None,
+            avatar,
             notes_open: HashSet::default(),
             sent: None,
             _subscriptions: Vec::new(),
@@ -412,23 +416,33 @@ impl SpecReviewView {
         let Some(doc) = &self.doc else {
             return;
         };
+        // Answers and comments go with the approval, as in the browser UI.
+        // Without them, Claude sees an approval with every question open.
+        let has_feedback = !self.record.comments.is_empty()
+            || self.record.answers.values().any(|answer| !answer.is_empty());
+        let feedback = if has_feedback {
+            spec_doc::export_feedback(&doc.blocks, &self.record.comments, &self.record.answers)
+        } else {
+            String::new()
+        };
+        let annotations = annotations(&doc.blocks, &self.record.comments, &self.record.answers);
         // Without --gate the session has no approve route. Plain feedback then
         // tells Claude the same thing.
-        let (url, body) = if doc.gate {
-            (
-                format!("{}/api/approve", self.session.url),
-                serde_json::json!({ "feedback": "", "annotations": [], "codeAnnotations": [] }),
-            )
+        let (url, feedback) = if doc.gate {
+            (format!("{}/api/approve", self.session.url), feedback)
         } else {
-            (
-                format!("{}/api/feedback", self.session.url),
-                serde_json::json!({
-                    "feedback": "Approved. I reviewed the document and have no changes.",
-                    "annotations": [],
-                    "codeAnnotations": [],
-                }),
-            )
+            let message = if has_feedback {
+                format!("Approved, with the answers and notes below.\n\n{feedback}")
+            } else {
+                "Approved. I reviewed the document and have no changes.".to_string()
+            };
+            (format!("{}/api/feedback", self.session.url), message)
         };
+        let body = serde_json::json!({
+            "feedback": feedback,
+            "annotations": annotations,
+            "codeAnnotations": [],
+        });
         self.submit(url, body, true, cx);
     }
 
@@ -653,20 +667,7 @@ impl SpecReviewView {
                     })
                     .child(content)
                     .children(comments.into_iter().map(|comment| self.render_comment(comment, &colors, cx)))
-                    .when_some(input, |content, input| {
-                        content.child(
-                            h_flex()
-                                .mt_2()
-                                .gap_2()
-                                .child(div().flex_1().min_w_0().child(field_box(input, true, &colors)))
-                                .child(
-                                    Button::new(("add-spec-comment", ix), "Comment")
-                                        .style(ButtonStyle::Filled)
-                                        .label_size(LabelSize::Small)
-                                        .on_click(cx.listener(|this, _, window, cx| this.submit_comment(window, cx))),
-                                ),
-                        )
-                    }),
+                    .when_some(input, |content, input| content.child(self.render_comment_input(input, &colors, cx))),
             )
             .child(
                 div()
@@ -691,21 +692,87 @@ impl SpecReviewView {
             .into_any_element()
     }
 
+    /// The avatar circle of the diff review comments (`render_comment_row` in
+    /// `crates/editor/src/git.rs`), so both kinds of review look the same.
+    fn render_avatar(&self) -> AnyElement {
+        let size = px(20.);
+        div()
+            .size(size)
+            .flex_shrink_0()
+            .rounded_full()
+            .overflow_hidden()
+            .child(match &self.avatar {
+                Some(uri) => Avatar::new(uri.clone()).size(size).into_any_element(),
+                None => Icon::new(IconName::Person)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            })
+            .into_any_element()
+    }
+
+    fn render_comment_input(&self, input: Entity<Editor>, colors: &ThemeColors, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .mt_2()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .rounded_md()
+            .bg(colors.surface_background)
+            .child(self.render_avatar())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .border_1()
+                    .border_color(colors.border)
+                    .rounded_md()
+                    .bg(colors.editor_background)
+                    .px_2()
+                    .py_1()
+                    .child(input),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .child(
+                        IconButton::new("spec-comment-close", IconName::Close)
+                            .icon_color(Color::Muted)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Close"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.comment_input = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        IconButton::new("spec-comment-add", IconName::Return)
+                            .icon_color(Color::Muted)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Add comment"))
+                            .on_click(cx.listener(|this, _, window, cx| this.submit_comment(window, cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_comment(&self, comment: SpecComment, colors: &ThemeColors, cx: &mut Context<Self>) -> AnyElement {
         let created_at = comment.created_at;
         let finished = self.is_finished();
         h_flex()
             .group("spec-comment")
             .mt_2()
-            .px_2p5()
-            .py_1p5()
+            .w_full()
+            .items_center()
             .gap_2()
-            .items_start()
+            .px_2()
+            .py_1p5()
             .rounded_md()
-            .border_l_2()
-            .border_color(colors.text_accent)
-            .bg(colors.text_accent.opacity(0.08))
-            .child(Label::new("You").size(LabelSize::Small).weight(FontWeight::SEMIBOLD).color(Color::Accent))
+            .bg(colors.surface_background)
+            .child(self.render_avatar())
             .child(div().flex_1().min_w_0().text_sm().text_color(colors.text).child(comment.text))
             .when(!finished, |row| {
                 row.child(

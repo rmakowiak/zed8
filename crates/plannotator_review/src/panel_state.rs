@@ -73,6 +73,7 @@ pub fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
     let mut specs = session::find_spec_sessions(&crate::paths::sessions_dir());
     session::add_ancestors(&mut sessions);
     session::add_ancestors(&mut specs);
+    specs.retain(|spec| session::spec_belongs_to(spec, &roots));
     let guide = guide::find_guide(&crate::paths::guides_dir(), branch.as_deref(), head.as_deref());
     let mut file_stats = HashMap::default();
     let base = guide

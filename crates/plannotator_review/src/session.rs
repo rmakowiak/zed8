@@ -25,6 +25,9 @@ pub struct Session {
     /// Claude Code process that started the session is one of them.
     #[serde(skip)]
     pub ancestors: Vec<i32>,
+    /// The working folder of each process in `ancestors`, where known.
+    #[serde(skip)]
+    pub ancestor_cwds: Vec<PathBuf>,
 }
 
 impl Session {
@@ -76,7 +79,50 @@ pub fn add_ancestors(sessions: &mut [Session]) {
     let parents = process_parents();
     for session in sessions {
         session.ancestors = ancestors(&parents, session.pid);
+        session.ancestor_cwds = session.ancestors.iter().filter_map(|pid| process_cwd(*pid)).collect();
     }
+}
+
+/// Whether a spec review belongs to a window with `roots` open. A spec file
+/// often lives outside the worktree (in Claude's scratchpad), so the folder
+/// that the Claude process behind the session runs in decides. Without this,
+/// a spec from one worktree also opens in the windows of other worktrees.
+pub fn spec_belongs_to(session: &Session, roots: &[PathBuf]) -> bool {
+    let roots: Vec<PathBuf> = roots.iter().map(|root| canonical(root)).collect();
+    let inside = |path: &Path| {
+        let path = canonical(path);
+        roots.iter().any(|root| path.starts_with(root))
+    };
+    session.target.as_deref().is_some_and(|target| inside(Path::new(target)))
+        || session.ancestor_cwds.iter().any(|cwd| inside(cwd))
+}
+
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: i32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut info).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if written != size {
+        return None;
+    }
+    let path = info.pvi_cdir.vip_path.as_flattened();
+    let bytes: Vec<u8> = path.iter().take_while(|byte| **byte != 0).map(|byte| *byte as u8).collect();
+    // "/" is the folder of processes started by launchd, such as Zed itself.
+    (bytes.len() > 1).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_cwd(pid: i32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
 /// The parent of each running process, by pid.
@@ -146,8 +192,13 @@ fn read_sessions(dir: &Path) -> Vec<Session> {
         .collect()
 }
 
+/// Resolves links such as macOS `/var` to `/private/var`. A file that is gone
+/// still resolves through its folder, so it compares like the roots.
 fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path)
+        .ok()
+        .or_else(|| Some(std::fs::canonicalize(path.parent()?).ok()?.join(path.file_name()?)))
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 fn process_is_alive(pid: i32) -> bool {
@@ -202,6 +253,35 @@ mod tests {
             find_review_sessions_with(sessions.path(), &[worktree.path().to_path_buf()], |_| true)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn spec_belongs_to_the_worktree_of_its_claude_process() {
+        let worktree = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let scratchpad = tempfile::tempdir().unwrap();
+        let spec = |target: &Path, cwds: Vec<PathBuf>| Session {
+            pid: 1,
+            url: String::new(),
+            mode: "annotate".into(),
+            target: Some(target.display().to_string()),
+            started_at: String::new(),
+            ancestors: Vec::new(),
+            ancestor_cwds: cwds,
+        };
+        let roots = [worktree.path().to_path_buf()];
+        let in_scratchpad = scratchpad.path().join("spec.md");
+        std::fs::create_dir(worktree.path().join("sub")).unwrap();
+        assert!(spec_belongs_to(&spec(&in_scratchpad, vec![worktree.path().join("sub")]), &roots));
+        assert!(spec_belongs_to(&spec(&worktree.path().join("spec.md"), Vec::new()), &roots));
+        assert!(!spec_belongs_to(&spec(&in_scratchpad, vec![other.path().to_path_buf()]), &roots));
+        assert!(!spec_belongs_to(&spec(&in_scratchpad, Vec::new()), &roots));
+    }
+
+    #[test]
+    fn reads_the_folder_of_this_process() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(process_cwd(std::process::id() as i32).map(|path| canonical(&path)), Some(canonical(&cwd)));
     }
 
     #[test]

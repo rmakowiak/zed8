@@ -2,9 +2,11 @@
 """Plannotator browser hook for the Zed fork.
 
 Plannotator runs this with the session URL when PLANNOTATOR_BROWSER is its
-path. If a running fork Zed has the session's worktree open (code review),
-or any fork Zed runs (spec review of a markdown file), Zed takes the session
-and no browser opens. Otherwise the browser in ZED_FALLBACK_BROWSER opens.
+path. If a running fork Zed has the session's worktree open, Zed takes the
+session and no browser opens. Otherwise the browser in ZED_FALLBACK_BROWSER
+opens. For a spec review (a markdown file), the worktree is the folder of the
+file or the folder that the Claude process behind the session runs in, as in
+`spec_belongs_to` in crates/plannotator_review/src/session.rs.
 """
 import glob
 import json
@@ -57,15 +59,53 @@ def zed_roots():
     return [os.path.realpath(root) for root in roots]
 
 
+def ancestor_cwds(pid):
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid="], capture_output=True, text=True).stdout
+    except OSError:
+        return []
+    parents = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            parents[int(parts[0])] = int(parts[1])
+    cwds = []
+    seen = set()
+    current = int(pid)
+    while current in parents and parents[current] > 1 and parents[current] not in seen:
+        current = parents[current]
+        seen.add(current)
+        try:
+            lsof = subprocess.run(
+                ["lsof", "-a", "-p", str(current), "-d", "cwd", "-Fn"],
+                capture_output=True,
+                text=True,
+            ).stdout
+        except OSError:
+            continue
+        for row in lsof.splitlines():
+            if row.startswith("n") and row != "n/":
+                cwds.append(os.path.realpath(row[1:]))
+    return cwds
+
+
+def inside(path, roots):
+    return any(path == root or path.startswith(root + os.sep) for root in roots)
+
+
 def zed_takes(session):
     roots = zed_roots()
     if not roots or not session:
         return False
     target = os.path.realpath(session.get("target") or "")
     if session.get("mode") == "annotate":
-        return target.endswith((".md", ".mdx", ".markdown"))
+        if not target.endswith((".md", ".mdx", ".markdown")):
+            return False
+        if inside(target, roots):
+            return True
+        return any(inside(cwd, roots) for cwd in ancestor_cwds(session.get("pid", 0)))
     if session.get("mode") == "review":
-        return any(target == root or target.startswith(root + os.sep) for root in roots)
+        return inside(target, roots)
     return False
 
 

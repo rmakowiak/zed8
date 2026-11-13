@@ -123,11 +123,10 @@ impl ReviewPanel {
                         .filter(|spec| !this.state.specs.iter().any(|old| old.pid == spec.pid))
                         .cloned()
                         .collect();
-                    let reveal = !new_specs.is_empty()
-                        || !first_load
-                            && ((guide_id(&state).is_some() && guide_id(&state) != guide_id(&this.state))
-                                || (session_pid(&state).is_some()
-                                    && session_pid(&state) != session_pid(&this.state)));
+                    // A new spec review opens only its tab: the panel adds nothing to it.
+                    let reveal = !first_load
+                        && ((guide_id(&state).is_some() && guide_id(&state) != guide_id(&this.state))
+                            || (session_pid(&state).is_some() && session_pid(&state) != session_pid(&this.state)));
                     if session_pid(&state).is_some() && session_pid(&state) != session_pid(&this.state) {
                         this.code_sent = None;
                     }
@@ -358,7 +357,14 @@ impl ReviewPanel {
                         .detach();
                     }
                 }
-                let view = cx.new(|cx| SpecReviewView::new(spec.clone(), http, window, cx));
+                let avatar = workspace
+                    .project()
+                    .read(cx)
+                    .user_store()
+                    .read(cx)
+                    .current_user()
+                    .map(|user| user.avatar_uri.clone());
+                let view = cx.new(|cx| SpecReviewView::new(spec.clone(), http, avatar, window, cx));
                 workspace.active_pane().update(cx, |pane, cx| {
                     pane.add_item(Box::new(view.clone()), true, focus, None, window, cx);
                 });
