@@ -14,6 +14,7 @@ mod note_thread;
 mod panel;
 mod panel_state;
 mod paths;
+mod resume;
 mod rich_text;
 mod session;
 mod spec_doc;
@@ -35,7 +36,10 @@ use std::{
 use util::ResultExt as _;
 use workspace::Workspace;
 
+pub use start::start_claude;
+
 pub fn init(cx: &mut App) {
+    resume::init(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         start::init(workspace);
         workspace
@@ -46,6 +50,7 @@ pub fn init(cx: &mut App) {
         let Some(window) = window else {
             return;
         };
+        resume::start_recording(window, cx);
         let review_panel = cx.new(|cx| panel::ReviewPanel::new(workspace, window, cx));
         workspace.add_panel(review_panel, window, cx);
     })

@@ -31,3 +31,8 @@ pub fn unsent_dir() -> PathBuf {
 pub fn windows_dir() -> PathBuf {
     plannotator_dir().join("zed-windows")
 }
+
+/// The Claude Code session of each terminal thread, so a restored thread resumes it.
+pub fn claude_terminal_sessions_file() -> PathBuf {
+    plannotator_dir().join("zed-claude-terminal-sessions.json")
+}

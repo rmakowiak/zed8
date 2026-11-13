@@ -98,8 +98,8 @@ fn ask_claude(
 }
 
 /// Starts Claude Code in a new terminal of the worktree, with `command` as
-/// its first prompt if there is one.
-pub(crate) fn start_claude(
+/// its first prompt if there is one. The `zed://claude` URL also calls it.
+pub fn start_claude(
     workspace: &mut Workspace,
     command: Option<String>,
     window: &mut Window,
@@ -148,6 +148,11 @@ pub(crate) struct ClaudeTerminal {
 impl ClaudeTerminal {
     pub fn id(&self) -> EntityId {
         self.terminal.entity_id()
+    }
+
+    /// The process ID of Claude itself.
+    pub fn pid(&self) -> Option<i32> {
+        self.pid
     }
 
     /// Claude in this terminal started `session`: Plannotator runs below it

@@ -14,12 +14,16 @@ upstream file, add a row here in the same commit.
 | `Cargo.lock` | Entries for `plannotator_review` | Follows from `Cargo.toml`. On a conflict, take upstream's file and run `cargo build` to add the entries again. |
 | `crates/zed/Cargo.toml` | `plannotator_review.workspace = true` | The app depends on the crate. |
 | `crates/zed/src/main.rs` | `plannotator_review::init(cx);` after `git_ui::init(cx);` | Starts the review panel and its actions. |
+| `crates/zed/src/main.rs` | The `OpenRequestKind::ClaudeTerminal` arm in `handle_open_request` | Opens the folder of a `zed://claude` URL and starts Claude Code there. |
+| `crates/zed/src/zed/open_listener.rs` | `OpenRequestKind::ClaudeTerminal`, `parse_claude_url` and `test_parse_claude_url` | Reads `zed://claude?cwd=<path>&prompt=<text>`. Raycast Workbench opens it with `open -a Zed8.app`. |
 | `crates/feature_flags/src/flags.rs` | `DiffReviewFeatureFlag::enabled_for_all` returns `true` | Inline review comments in diffs are on without a settings line. |
 | `crates/feature_flags/src/store.rs` | `overrides_enabled` ignores the staff and debug check | Settings can turn other flags on in a release build. |
 | `crates/editor/src/editor.rs` | `ExportedReviewComment` in the `pub use git::{...}` list | The crate reads review comments. |
 | `crates/editor/src/git.rs` | `ExportedReviewComment` and `take_review_comments_for_export` | The crate takes the comments of a diff to send them. |
 | `crates/git_ui/src/branch_diff.rs` | `BranchDiff::editor` is public (no `cfg(test)`) | The crate reads comments in the branch diff. |
 | `crates/agent_ui/src/agent_panel.rs` | `AgentPanel::terminal_view(terminal_id)` | The crate finds Claude terminal threads, also in the background. |
+| `crates/agent_ui/src/agent_panel.rs` | `TerminalResumeSession`, `with_resume_session` in `spawn_terminal`, and `TerminalId::to_key_string` and `from_key_string` are public | A restored terminal thread runs `claude --resume <session>`. The crate records the sessions. |
+| `crates/agent_ui/src/agent_ui.rs` | `TerminalResumeSession` in the `pub use crate::agent_panel::{...}` list | The crate sets the hook. |
 | `crates/sidebar/src/sidebar.rs` | Worktree groups. See the list under the table. | The threads sidebar groups threads by worktree. This is the largest change to upstream code. |
 | `crates/sidebar/src/sidebar_tests.rs` | `test_threads_are_grouped_by_worktree` | Tests the grouping. |
 

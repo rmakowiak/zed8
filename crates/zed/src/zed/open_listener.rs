@@ -82,6 +82,10 @@ pub enum OpenRequestKind {
     GitCommit {
         sha: String,
     },
+    /// Zed8: starts Claude Code in a new terminal of the opened folder.
+    ClaudeTerminal {
+        prompt: Option<String>,
+    },
 }
 
 impl std::fmt::Debug for OpenRequestKind {
@@ -120,6 +124,10 @@ impl std::fmt::Debug for OpenRequestKind {
                 .field("repo_url", repo_url)
                 .finish(),
             Self::GitCommit { sha } => f.debug_struct("GitCommit").field("sha", sha).finish(),
+            Self::ClaudeTerminal { prompt } => f
+                .debug_struct("ClaudeTerminal")
+                .field("prompt", prompt)
+                .finish(),
         }
     }
 }
@@ -194,6 +202,8 @@ impl OpenRequest {
                 this.parse_git_clone_url(clone_path)?
             } else if let Some(commit_path) = url.strip_prefix("zed://git/commit/") {
                 this.parse_git_commit_url(commit_path)?
+            } else if let Some(claude_path) = url.strip_prefix("zed://claude") {
+                this.parse_claude_url(claude_path)?
             } else if url.starts_with("ssh://") {
                 this.parse_ssh_file_path(&url, cx)?
             } else if let Some(zed_link) = parse_zed_link(&url, cx) {
@@ -298,6 +308,25 @@ impl OpenRequest {
             sha: sha.to_string(),
         });
 
+        Ok(())
+    }
+
+    fn parse_claude_url(&mut self, claude_path: &str) -> Result<()> {
+        // Format: ?cwd=<path>&prompt=<text>. The prompt is optional.
+        let claude_path = claude_path.strip_prefix('/').unwrap_or(claude_path);
+        let query = claude_path
+            .strip_prefix('?')
+            .context("invalid claude url: missing query string")?;
+        let param = |name: &str| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+                .filter(|value| !value.is_empty())
+        };
+        let cwd = param("cwd").context("invalid claude url: missing cwd query parameter")?;
+        self.open_paths.push(cwd);
+        self.kind = Some(OpenRequestKind::ClaudeTerminal {
+            prompt: param("prompt"),
+        });
         Ok(())
     }
 
@@ -1777,6 +1806,44 @@ mod tests {
             }
             _ => panic!("Expected AgentPanel kind"),
         }
+    }
+
+    #[gpui::test]
+    fn test_parse_claude_url(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+        let parse = |url: &str, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                OpenRequest::parse(
+                    RawOpenRequest {
+                        urls: vec![url.into()],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+        };
+
+        let request = parse(
+            "zed://claude?cwd=%2FUsers%2Fme%2Fn8n&prompt=%2Ftriage-linear%20CONTEXT-488",
+            cx,
+        )
+        .unwrap();
+        match request.kind.unwrap() {
+            OpenRequestKind::ClaudeTerminal { prompt } => {
+                assert_eq!(prompt.as_deref(), Some("/triage-linear CONTEXT-488"));
+            }
+            _ => panic!("expected ClaudeTerminal variant"),
+        }
+        assert_eq!(request.open_paths, vec!["/Users/me/n8n"]);
+
+        let request = parse("zed://claude/?cwd=%2Ftmp", cx).unwrap();
+        match request.kind.unwrap() {
+            OpenRequestKind::ClaudeTerminal { prompt } => assert_eq!(prompt, None),
+            _ => panic!("expected ClaudeTerminal variant"),
+        }
+
+        assert!(parse("zed://claude?prompt=hi", cx).is_err());
+        assert!(parse("zed://claude", cx).is_err());
     }
 
     #[gpui::test]

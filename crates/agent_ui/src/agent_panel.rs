@@ -130,6 +130,12 @@ const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "qwen",
 ];
 
+/// Zed8: returns the Claude Code session that last ran in a terminal thread.
+/// A restored thread then runs its init command with `--resume <session>`.
+pub struct TerminalResumeSession(pub Box<dyn Fn(TerminalId) -> Option<String>>);
+
+impl gpui::Global for TerminalResumeSession {}
+
 fn is_known_terminal_agent_command(command: &str) -> bool {
     KNOWN_TERMINAL_AGENT_COMMANDS.contains(&command)
 }
@@ -158,11 +164,11 @@ impl TerminalId {
         Self(uuid::Uuid::new_v4())
     }
 
-    pub(crate) fn to_key_string(self) -> String {
+    pub fn to_key_string(self) -> String {
         self.0.hyphenated().to_string()
     }
 
-    pub(crate) fn from_key_string(key: &str) -> anyhow::Result<Self> {
+    pub fn from_key_string(key: &str) -> anyhow::Result<Self> {
         Ok(Self(uuid::Uuid::parse_str(key)?))
     }
 }
@@ -2056,7 +2062,8 @@ impl AgentPanel {
         // as empty and spawning a second, "initial" terminal on activation.
         self.pending_terminal_spawn = Some(terminal_id);
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = Self::terminal_init_command(run_init_command, cx)
+            .map(|command| Self::with_resume_session(command, terminal_id, cx));
         let terminal_task = self.create_terminal_shell(working_directory, cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
@@ -2134,6 +2141,19 @@ impl AgentPanel {
             .then(|| AgentSettings::get_global(cx).terminal_init_command.clone())
             .flatten()
             .filter(|command| !command.trim().is_empty())
+    }
+
+    /// Zed8: `claude` becomes `claude --resume <session>` when the thread had a session.
+    fn with_resume_session(command: String, terminal_id: TerminalId, cx: &App) -> String {
+        let runs_claude = command.split_whitespace().next() == Some("claude");
+        let session = runs_claude
+            .then(|| cx.try_global::<TerminalResumeSession>())
+            .flatten()
+            .and_then(|resume| (resume.0)(terminal_id));
+        match session {
+            Some(session) => format!("{} --resume {session}", command.trim_end()),
+            None => command,
+        }
     }
 
     fn write_terminal_init_command(
