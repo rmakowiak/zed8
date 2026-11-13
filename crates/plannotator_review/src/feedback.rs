@@ -56,7 +56,7 @@ pub fn build_request(
     }
 }
 
-fn markdown(comments: &[ExportedReviewComment], worktree: &str) -> String {
+pub(crate) fn markdown(comments: &[ExportedReviewComment], worktree: &str) -> String {
     if comments.is_empty() {
         return "# Code Review\n\nNo feedback provided.".to_string();
     }

@@ -1,5 +1,8 @@
 //! One of Claude's guide notes, shown inline in a chapter tab, with your
 //! replies under it as a thread. Replies go to Claude with the review comments.
+//!
+//! A thread can also hold a finding of the agent review (gate 2). Then you
+//! edit or delete the finding instead of replying to it.
 
 use crate::guide::GuideNote;
 use editor::{Editor, ExportedReviewComment};
@@ -19,6 +22,16 @@ pub struct ThreadDraft {
 
 pub enum NoteThreadEvent {
     RepliesChanged,
+    /// A finding was edited, deleted or restored. `text` is `None` when it is deleted.
+    FindingChanged { id: String, text: Option<String> },
+}
+
+/// A finding of the agent review, from a Plannotator external annotation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Finding {
+    pub id: String,
+    pub deleted: bool,
+    pub edited: bool,
 }
 
 pub struct NoteThread {
@@ -33,6 +46,8 @@ pub struct NoteThread {
     collapsed: bool,
     input: Entity<Editor>,
     _input_subscriptions: [Subscription; 2],
+    finding: Option<Finding>,
+    editing: bool,
 }
 
 impl NoteThread {
@@ -64,7 +79,75 @@ impl NoteThread {
             collapsed: false,
             input,
             _input_subscriptions: input_subscriptions,
+            finding: None,
+            editing: false,
         }
+    }
+
+    /// A thread for a finding of the agent review.
+    pub fn new_finding(
+        file: String,
+        note: GuideNote,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut thread = Self::new(file, note, ThreadDraft::default(), window, cx);
+        thread.finding = Some(Finding { id, deleted: false, edited: false });
+        thread
+    }
+
+    pub fn finding(&self) -> Option<&Finding> {
+        self.finding.as_ref()
+    }
+
+    /// The finding as you want it sent, or `None` when you deleted it.
+    pub fn finding_export(&self) -> Option<ExportedReviewComment> {
+        let finding = self.finding.as_ref()?;
+        (!finding.deleted).then(|| ExportedReviewComment {
+            file_path: self.file.clone(),
+            line_start: self.note.line_start,
+            line_end: self.note.line_end,
+            text: self.note.text.clone(),
+        })
+    }
+
+    fn start_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing = true;
+        self.collapsed = false;
+        let text = self.note.text.clone();
+        self.input.update(cx, |input, cx| input.set_text(text, window, cx));
+        window.focus(&self.input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn toggle_deleted(&mut self, cx: &mut Context<Self>) {
+        let Some(finding) = self.finding.as_mut() else {
+            return;
+        };
+        finding.deleted = !finding.deleted;
+        let text = (!finding.deleted).then(|| self.note.text.clone());
+        cx.emit(NoteThreadEvent::FindingChanged { id: finding.id.clone(), text });
+        cx.notify();
+    }
+
+    fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text(cx).trim().to_string();
+        self.editing = false;
+        self.input.update(cx, |input, cx| input.clear(window, cx));
+        let Some(finding) = self.finding.as_mut() else {
+            return;
+        };
+        if text.is_empty() || text == self.note.text {
+            cx.notify();
+            return;
+        }
+        finding.edited = true;
+        self.note.text = text.clone();
+        self.text = text.clone().into();
+        self.body = cx.new(|cx| Markdown::new(crate::rich_text::render_mermaid(&text).into(), None, None, cx));
+        cx.emit(NoteThreadEvent::FindingChanged { id: finding.id.clone(), text: Some(text) });
+        cx.notify();
     }
 
     /// Identifies the note in the drafts file.
@@ -108,6 +191,10 @@ impl NoteThread {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.finding.is_some() {
+            self.save_edit(window, cx);
+            return;
+        }
         let text = self.input.read(cx).text(cx).trim().to_string();
         if text.is_empty() {
             return;
@@ -211,10 +298,15 @@ impl Render for NoteThread {
                 .color(Color::Muted),
             )
             .child(
-                Label::new("✦ Claude note")
-                    .size(LabelSize::Small)
-                    .weight(FontWeight::SEMIBOLD)
-                    .color(Color::Accent),
+                Label::new(match &self.finding {
+                    Some(finding) if finding.deleted => "✦ Agent review · deleted",
+                    Some(finding) if finding.edited => "✦ Agent review · edited by you",
+                    Some(_) => "✦ Agent review",
+                    None => "✦ Claude note",
+                })
+                .size(LabelSize::Small)
+                .weight(FontWeight::SEMIBOLD)
+                .color(Color::Accent),
             )
             .when(!collapsed, |header| {
                 header
@@ -249,10 +341,35 @@ impl Render for NoteThread {
             .map(|(ix, reply)| self.render_reply(ix, reply, cx))
             .collect();
 
+        let finding = self.finding.clone();
+        let deleted = finding.as_ref().is_some_and(|finding| finding.deleted);
+        let editing = self.editing;
+        let finding_buttons = finding.as_ref().map(|finding| {
+            h_flex()
+                .pl_5()
+                .gap_1()
+                .when(!finding.deleted && !editing, |row| {
+                    row.child(
+                        Button::new("edit-finding", "Edit")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener(|this, _, window, cx| this.start_edit(window, cx))),
+                    )
+                })
+                .when(!editing, |row| {
+                    row.child(
+                        Button::new("delete-finding", if finding.deleted { "Restore" } else { "Delete" })
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::XSmall)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_deleted(cx))),
+                    )
+                })
+        });
         v_flex()
             .max_w(px(820.))
             .flex_1()
             .my_1()
+            .when(deleted, |thread| thread.opacity(0.5))
             .px_3()
             .py_2()
             .gap_1()
@@ -268,8 +385,10 @@ impl Render for NoteThread {
                         div()
                             .pl_5()
                             .text_color(text_color)
+                            .when(deleted, |body| body.line_through())
                             .child(MarkdownElement::new(self.body.clone(), body_style)),
                     )
+                    .children(finding_buttons)
                     .when(!replies.is_empty(), |thread| {
                         thread.child(
                             v_flex()
@@ -280,7 +399,7 @@ impl Render for NoteThread {
                                 .children(replies),
                         )
                     })
-                    .child(
+                    .when(finding.is_none() || editing, |thread| thread.child(
                         h_flex()
                             .ml_5()
                             .mt_1()
@@ -293,14 +412,14 @@ impl Render for NoteThread {
                             .bg(editor_background)
                             .child(div().flex_1().min_w_0().child(self.input.clone()))
                             .child(
-                                Button::new("reply", "Reply")
+                                Button::new("reply", if editing { "Save" } else { "Reply" })
                                     .style(ButtonStyle::Tinted(TintColor::Accent))
                                     .label_size(LabelSize::Small)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.submit(window, cx)
                                     })),
                             ),
-                    )
+                    ))
             })
     }
 }

@@ -3,6 +3,7 @@
 
 use crate::{
     actions::{self, ActionProgress, ActionStore, ReviewAction},
+    manual_test_view::{self, ManualTestResults},
     guide::{self, LoadedGuide},
     session::{self, Session},
     start::{self, PullRequest},
@@ -36,6 +37,8 @@ pub struct PanelState {
     pub actions: ActionStore,
     /// The progress that each started action reports.
     pub progress: BTreeMap<ReviewAction, ActionProgress>,
+    /// The `results.json` of the manual test of this branch, and its path.
+    pub manual_results: Option<(PathBuf, ManualTestResults)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -125,7 +128,11 @@ pub fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
         }
         None => Default::default(),
     };
+    let manual_results = actions::review_target(pr.as_ref().map(|pr| pr.number), branch.as_deref())
+        .map(|target| crate::paths::reviews_dir().join(target).join("manual-test").join("results.json"))
+        .and_then(|path| Some((path.clone(), manual_test_view::load_results(&path)?)));
     PanelState {
+        manual_results,
         actions,
         progress,
         roots,

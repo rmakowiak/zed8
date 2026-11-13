@@ -37,6 +37,12 @@ pub fn claude_terminal_sessions_file() -> PathBuf {
     plannotator_dir().join("zed-claude-terminal-sessions.json")
 }
 
+/// The review folders of the `pr-review` and `manual-test` skills, one for
+/// each target such as `pr-43508`.
+pub fn reviews_dir() -> PathBuf {
+    util::paths::home_dir().join("workspace").join("n8n-reviews")
+}
+
 /// The review actions of each worktree: their threads and their progress.
 pub fn actions_dir() -> PathBuf {
     plannotator_dir().join("zed-actions")

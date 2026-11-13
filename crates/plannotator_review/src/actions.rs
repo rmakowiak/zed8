@@ -82,6 +82,10 @@ pub struct ActionStore {
     /// Hidden action keys, by PR number. Hiding is per PR.
     #[serde(default)]
     pub hidden: BTreeMap<String, BTreeSet<String>>,
+    /// The `endedAt` of the manual test results that you opened, by target.
+    /// Newer results go back into Needs you.
+    #[serde(default)]
+    pub seen_results: BTreeMap<String, String>,
 }
 
 impl ActionStore {
@@ -127,6 +131,16 @@ pub struct ActionProgress {
     /// The action is finished.
     #[serde(default)]
     pub done: bool,
+}
+
+/// The name of the review folder of a branch: `pr-<number>` with a PR, else
+/// the branch with `/` replaced by `-`. The skills use the same rule.
+pub fn review_target(pr: Option<u64>, branch: Option<&str>) -> Option<String> {
+    match (pr, branch) {
+        (Some(pr), _) => Some(format!("pr-{pr}")),
+        (None, Some(branch)) if branch != "HEAD" => Some(branch.replace('/', "-")),
+        _ => None,
+    }
 }
 
 /// A worktree path as a file name: every character that is not a letter or

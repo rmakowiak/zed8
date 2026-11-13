@@ -80,6 +80,9 @@ pub struct GuideNote {
     #[serde(default)]
     pub side: Option<String>,
     pub text: String,
+    /// Set for a finding of the agent review, which is not part of a guide.
+    #[serde(skip)]
+    pub finding_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

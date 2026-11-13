@@ -4,6 +4,8 @@
 use crate::{
     actions::{self, ReviewAction},
     chapter_view::{ChapterDiffView, ChapterIntro, ChapterKey, ChapterNavEvent},
+    findings::{self, AnnotationsResponse},
+    manual_test_view::ManualTestView,
     guide::{self, LoadedGuide},
     panel_state::{PanelState, announce_roots, load_state},
     session::Session,
@@ -163,6 +165,7 @@ impl ReviewPanel {
                         })
                         .log_err();
                 }
+                this.update(cx, |this, cx| this.refresh_results_tab(cx)).log_err();
                 for spec in new_specs {
                     this.update_in(cx, |this, window, cx| this.open_spec(spec, false, window, cx))
                         .log_err();
@@ -482,7 +485,9 @@ impl ReviewPanel {
             })
             .cloned()
             .collect();
-        if self.state.specs.is_empty() && results.is_empty() {
+        let unseen = self.unseen_results();
+        let gate2 = self.findings_session(&self.claude_terminals(cx));
+        if self.state.specs.is_empty() && results.is_empty() && unseen.is_none() && gate2.is_none() {
             return None;
         }
         let colors = cx.theme().colors();
@@ -539,6 +544,59 @@ impl ReviewPanel {
                 v_flex().w_full().child(row).child(div().pl_6().child(thread)).into_any_element()
             })
             .collect();
+        if let Some((total, failed)) = unseen {
+            rows.insert(
+                0,
+                h_flex()
+                    .id("manual-results")
+                    .w_full()
+                    .px_1()
+                    .py_0p5()
+                    .gap_1p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_results(window, cx)))
+                    .child(Icon::new(IconName::PlayFilled).size(IconSize::Small).color(Color::Accent))
+                    .child(div().flex_1().min_w_0().child(Label::new("Manual test results").size(LabelSize::Small)))
+                    .child(
+                        Label::new(if failed > 0 {
+                            format!("{failed} of {total} failed")
+                        } else {
+                            format!("{total} passed")
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(if failed > 0 { Color::Error } else { Color::Success }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let gate2_count = usize::from(gate2.is_some());
+        if let Some(session) = gate2 {
+            let waited = waited_label(&session.started_at);
+            rows.insert(
+                0,
+                h_flex()
+                    .id("gate2-findings")
+                    .w_full()
+                    .px_1()
+                    .py_0p5()
+                    .gap_1p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_findings(session.clone(), window, cx)))
+                    .child(Icon::new(IconName::Sparkle).size(IconSize::Small).color(Color::Accent))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new("Agent review · review the findings").size(LabelSize::Small)),
+                    )
+                    .child(Label::new(waited).size(LabelSize::XSmall).color(Color::Warning))
+                    .into_any_element(),
+            );
+        }
         for result in results {
             let (name, _) = name_and_dir(&result.target);
             let busy = owner(&result.session).is_some_and(|owner| owner.busy);
@@ -585,7 +643,13 @@ impl ReviewPanel {
             );
         }
         Some(
-            Self::render_section(format!("Needs you · {}", self.state.specs.len()), cx)
+            Self::render_section(
+                format!(
+                    "Needs you · {}",
+                    self.state.specs.len() + usize::from(unseen.is_some()) + gate2_count
+                ),
+                cx,
+            )
                 .child(v_flex().gap_0p5().children(rows))
                 .into_any_element(),
         )
@@ -694,6 +758,123 @@ impl ReviewPanel {
         self.state.actions.threads.insert(action.key().to_string(), thread.to_key_string());
         actions::save_store(&dir, &root, &self.state.actions).log_err();
         cx.notify();
+    }
+
+    /// The gate 2 session of the agent review: a code review session that
+    /// the "Agent review" thread started.
+    fn findings_session(&self, terminals: &[start::ClaudeTerminal]) -> Option<Session> {
+        let terminal = self.action_terminal(ReviewAction::AgentReview, terminals)?;
+        self.state.sessions.iter().find(|session| terminal.owns(session)).cloned()
+    }
+
+    /// Opens the whole PR with the findings of the agent review, or switches to it.
+    fn open_findings(&mut self, session: Session, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.state.roots.first().cloned() else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let existing = workspace
+            .read(cx)
+            .items_of_type::<ChapterDiffView>(cx)
+            .find(|view| view.read(cx).findings_session_pid() == Some(session.pid));
+        if let Some(view) = existing {
+            workspace.update(cx, |workspace, cx| workspace.activate_item(&view, true, true, window, cx));
+            return;
+        }
+        let base = match self.state.pr.as_ref().map(|pr| pr.base_ref_name.as_str()) {
+            Some(base) if !base.is_empty() => format!("origin/{base}"),
+            _ => "origin/master".to_string(),
+        };
+        let title = match &self.state.pr {
+            Some(pr) => format!("Findings · PR #{}", pr.number),
+            None => "Findings".to_string(),
+        };
+        let http = self.http.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let url = format!("{}/api/external-annotations", session.url);
+            let annotations = crate::client::get_json::<AnnotationsResponse>(&http, &url).await?.annotations;
+            let files = cx
+                .background_executor()
+                .spawn({
+                    let root = root.clone();
+                    let base = base.clone();
+                    async move { findings::changed_files(&root, &base) }
+                })
+                .await?;
+            let (diffs, general) = findings::split(&annotations, &files);
+            let key = ChapterKey { guide_id: format!("findings-{}", session.pid), chapter: 0 };
+            let intro = ChapterIntro {
+                index: 0,
+                count: 1,
+                title: title.clone(),
+                overview: String::new(),
+                reviewed: false,
+            };
+            let task = workspace.update_in(cx, |workspace, window, cx| {
+                ChapterDiffView::open(key, title, intro, root.clone(), base, diffs, workspace, window, cx)
+            })?;
+            let view = task.await?;
+            let worktree = root.display().to_string();
+            view.update_in(cx, |view, window, cx| view.set_findings(session, http, worktree, general, window, cx))?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Results that you have not opened yet, for Needs you.
+    fn unseen_results(&self) -> Option<(usize, usize)> {
+        let (_, results) = self.state.manual_results.as_ref()?;
+        let seen = self.state.actions.seen_results.get(&results.target);
+        if seen == Some(&results.ended_at) || results.cases.is_empty() {
+            return None;
+        }
+        let (_, failed, blocked) = results.counts();
+        Some((results.cases.len(), failed + blocked))
+    }
+
+    fn open_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, results)) = self.state.manual_results.clone() else {
+            return;
+        };
+        if let Some(root) = self.state.roots.first() {
+            self.state.actions.seen_results.insert(results.target.clone(), results.ended_at.clone());
+            actions::save_store(&crate::paths::actions_dir(), root, &self.state.actions).log_err();
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let existing = workspace
+                    .items_of_type::<ManualTestView>(cx)
+                    .find(|view| view.read(cx).path() == path.as_path());
+                if let Some(view) = existing {
+                    workspace.activate_item(&view, true, true, window, cx);
+                    return;
+                }
+                let view = cx.new(|cx| ManualTestView::new(path, results, cx));
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.add_item(Box::new(view), true, true, None, window, cx);
+                });
+            })
+            .log_err();
+        cx.notify();
+    }
+
+    fn refresh_results_tab(&self, cx: &mut Context<Self>) {
+        let Some((path, results)) = self.state.manual_results.clone() else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let views: Vec<_> = workspace
+            .read(cx)
+            .items_of_type::<ManualTestView>(cx)
+            .filter(|view| view.read(cx).path() == path.as_path())
+            .collect();
+        for view in views {
+            view.update(cx, |view, cx| view.set_results(results.clone(), cx));
+        }
     }
 
     fn set_hidden(&mut self, action: ReviewAction, hidden: bool, cx: &mut Context<Self>) {
@@ -830,6 +1011,29 @@ impl ReviewPanel {
                         .disabled(blocked)
                         .tooltip(Tooltip::text(format!("Starts the Claude thread “{}”", action.title())))
                         .on_click(cx.listener(move |this, _, window, cx| this.start_action(action, window, cx))),
+                )
+            })
+            .when_some(
+                (action == ReviewAction::AgentReview).then(|| self.findings_session(terminals)).flatten(),
+                |row, session| {
+                    row.child(
+                        Button::new("open-findings", "Findings")
+                            .style(ButtonStyle::Filled)
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text("Opens the PR with the findings of gate 2"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_findings(session.clone(), window, cx)
+                            })),
+                    )
+                },
+            )
+            .when(action == ReviewAction::ManualTest && self.state.manual_results.is_some(), |row| {
+                row.child(
+                    Button::new("open-manual-results", "Results")
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .tooltip(Tooltip::text("Opens every test case with its proof"))
+                        .on_click(cx.listener(|this, _, window, cx| this.open_results(window, cx))),
                 )
             })
             .when(self.state.pr.is_some(), |row| {

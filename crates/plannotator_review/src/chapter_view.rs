@@ -4,7 +4,9 @@
 //! file buffer, so inline review comments work as in the branch diff.
 
 use crate::{
+    findings::{self, ExternalAnnotation},
     guide::{GuideDiff, GuideNote},
+    session::Session,
     note_thread::{self, NoteThread, NoteThreadEvent, ThreadDraft},
 };
 use anyhow::{Context as _, Result};
@@ -19,8 +21,9 @@ use editor::{
 use git_ui_core::file_diff_view::build_buffer_diff;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font, FontWeight,
-    IntoElement, Render, SharedString, Subscription, Task, Window, px,
+    IntoElement, Render, SharedString, Subscription, Task, WeakEntity, Window, px,
 };
+use http_client::{HttpClient, Method};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use language::{Buffer, Capability, HighlightedText, OffsetRangeExt, Point};
 use multi_buffer::{MultiBuffer, PathKey};
@@ -64,8 +67,21 @@ pub enum ChapterNavEvent {
     ToggleReviewed(usize),
 }
 
+/// Gate 2 of the agent review: the tab shows the whole PR with its findings.
+struct FindingsMode {
+    session: Session,
+    http: Arc<dyn HttpClient>,
+    worktree: String,
+    /// The review body and the findings that are not on a diff line.
+    general: Vec<Entity<NoteThread>>,
+    /// `Some(approved)` after Approve or Send feedback.
+    sent: Option<bool>,
+}
+
 pub struct ChapterDiffView {
     editor: Entity<SplittableEditor>,
+    workspace: WeakEntity<Workspace>,
+    findings: Option<FindingsMode>,
     key: ChapterKey,
     title: SharedString,
     intro: ChapterIntro,
@@ -183,6 +199,7 @@ impl ChapterDiffView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let workspace_handle = workspace.downgrade();
         let editor = cx.new(|cx| {
             let editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
@@ -220,6 +237,8 @@ impl ChapterDiffView {
         });
         Self {
             editor,
+            workspace: workspace_handle,
+            findings: None,
             key,
             title,
             intro,
@@ -258,16 +277,16 @@ impl ChapterDiffView {
         let mut drafts = load_drafts(&self.key.guide_id);
         let mut blocks = Vec::with_capacity(placements.len());
         for (placement, file, note) in placements {
-            let draft = drafts
-                .remove(&note_thread::draft_key(&file, &note))
-                .unwrap_or_default();
-            let thread = cx.new(|cx| NoteThread::new(file, note, draft, window, cx));
-            self._subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| match event {
-                NoteThreadEvent::RepliesChanged => {
-                    this.save_drafts(cx);
-                    this.emit_comment_count(cx);
+            let thread = match note.finding_id.clone() {
+                Some(id) => cx.new(|cx| NoteThread::new_finding(file, note, id, window, cx)),
+                None => {
+                    let draft = drafts
+                        .remove(&note_thread::draft_key(&file, &note))
+                        .unwrap_or_default();
+                    cx.new(|cx| NoteThread::new(file, note, draft, window, cx))
                 }
-            }));
+            };
+            self.subscribe_thread(&thread, cx);
             self.note_threads.push(thread.clone());
             blocks.push(BlockProperties {
                 placement,
@@ -291,12 +310,199 @@ impl ChapterDiffView {
         self.emit_comment_count(cx);
     }
 
+    fn subscribe_thread(&mut self, thread: &Entity<NoteThread>, cx: &mut Context<Self>) {
+        self._subscriptions.push(cx.subscribe(thread, |this, _, event, cx| match event {
+            NoteThreadEvent::RepliesChanged => {
+                this.save_drafts(cx);
+                this.emit_comment_count(cx);
+            }
+            NoteThreadEvent::FindingChanged { id, text } => this.sync_finding(id, text.clone(), cx),
+        }));
+    }
+
+    /// Turns this tab into gate 2 of the agent review.
+    pub fn set_findings(
+        &mut self,
+        session: Session,
+        http: Arc<dyn HttpClient>,
+        worktree: String,
+        general: Vec<ExternalAnnotation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let threads: Vec<Entity<NoteThread>> = general
+            .iter()
+            .map(|annotation| {
+                let note = findings::general_note(annotation);
+                let file = annotation.file_path.clone().unwrap_or_default();
+                cx.new(|cx| NoteThread::new_finding(file, note, annotation.id.clone(), window, cx))
+            })
+            .collect();
+        for thread in &threads {
+            self.subscribe_thread(thread, cx);
+        }
+        self.findings = Some(FindingsMode {
+            session,
+            http,
+            worktree,
+            general: threads,
+            sent: None,
+        });
+        cx.notify();
+    }
+
+    pub fn findings_session_pid(&self) -> Option<i32> {
+        self.findings.as_ref().map(|findings| findings.session.pid)
+    }
+
+    /// Keeps an edit in the Plannotator session, so it survives a restart of Zed.
+    fn sync_finding(&self, id: &str, text: Option<String>, cx: &mut Context<Self>) {
+        let Some(findings) = &self.findings else {
+            return;
+        };
+        let Some(text) = text else {
+            // A delete stays in Zed until you send, so Restore can undo it.
+            return;
+        };
+        let http = findings.http.clone();
+        let url = format!("{}/api/external-annotations?id={id}", findings.session.url);
+        cx.background_spawn(async move {
+            crate::client::send_json(&http, Method::PATCH, &url, &serde_json::json!({ "text": text })).await
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Approve or Send feedback: the findings as you left them, plus your own
+    /// inline comments, as one message to the Plannotator session.
+    fn send_findings(&mut self, approved: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(findings) = &self.findings else {
+            return;
+        };
+        let mut inline: Vec<ExportedReviewComment> = self
+            .note_threads
+            .iter()
+            .filter_map(|thread| thread.read(cx).finding_export())
+            .collect();
+        inline.extend(self.rhs_editor(cx).update(cx, |editor, cx| editor.take_review_comments_for_export(cx)));
+        let general: Vec<String> = findings
+            .general
+            .iter()
+            .filter_map(|thread| thread.read(cx).finding_export())
+            .map(|comment| comment.text)
+            .collect();
+        let count = inline.len() + general.len();
+        let message = findings::message(&inline, &general, &findings.worktree);
+        let http = findings.http.clone();
+        let url = format!("{}/api/feedback", findings.session.url);
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let body = serde_json::json!({ "approved": approved, "feedback": message, "annotations": [] });
+            let result = crate::client::send_json(&http, Method::POST, &url, &body).await;
+            let toast = match &result {
+                Ok(()) if approved => format!("Approved with {count} comments. The agent review goes on."),
+                Ok(()) => format!("Sent {count} comments to the agent review."),
+                Err(error) => format!("Send failed: {error}"),
+            };
+            if result.is_ok() {
+                this.update(cx, |this, cx| {
+                    if let Some(findings) = this.findings.as_mut() {
+                        findings.sent = Some(approved);
+                    }
+                    cx.notify();
+                })
+                .log_err();
+            }
+            workspace
+                .update(cx, |workspace, cx| crate::show_toast(workspace, toast, cx))
+                .log_err();
+        })
+        .detach();
+    }
+
+    fn render_findings_header(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let findings = self.findings.as_ref()?;
+        let colors = cx.theme().colors();
+        let inline = self.note_threads.iter().filter(|thread| thread.read(cx).finding().is_some()).count();
+        let edited = self
+            .note_threads
+            .iter()
+            .chain(&findings.general)
+            .filter(|thread| thread.read(cx).finding().is_some_and(|finding| finding.edited || finding.deleted))
+            .count();
+        let (status, color) = match findings.sent {
+            Some(true) => ("Approved".to_string(), Color::Success),
+            Some(false) => ("Sent to the agent review".to_string(), Color::Accent),
+            None => ("Gate 2 · waiting on you".to_string(), Color::Warning),
+        };
+        let done = findings.sent.is_some();
+        Some(
+            v_flex()
+                .w_full()
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .bg(colors.surface_background)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .gap_3()
+                        .child(Label::new(status).size(LabelSize::Small).color(color))
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(format!(
+                                    "{inline} on diff lines · {} general · {edited} changed by you · your own comments go too",
+                                    findings.general.len()
+                                ))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                            ),
+                        )
+                        .child(
+                            Button::new("findings-send", "Send feedback")
+                                .style(ButtonStyle::Outlined)
+                                .label_size(LabelSize::Small)
+                                .disabled(done)
+                                .on_click(cx.listener(|this, _, window, cx| this.send_findings(false, window, cx))),
+                        )
+                        .child(
+                            Button::new("findings-approve", "Approve")
+                                .style(ButtonStyle::Filled)
+                                .label_size(LabelSize::Small)
+                                .start_icon(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Success))
+                                .disabled(done)
+                                .on_click(cx.listener(|this, _, window, cx| this.send_findings(true, window, cx))),
+                        ),
+                )
+                .when(!findings.general.is_empty(), |header| {
+                    header.child(
+                        v_flex()
+                            .id("general-findings")
+                            .px_3()
+                            .pb_2()
+                            .max_h(px(320.))
+                            .overflow_y_scroll()
+                            .child(
+                                Label::new("REVIEW BODY AND COMMENTS NOT ON A DIFF LINE")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .children(findings.general.iter().cloned()),
+                    )
+                }),
+        )
+    }
+
     /// Writes this chapter's threads into the guide's drafts file. Threads of
     /// other chapters in the file stay as they are.
     fn save_drafts(&self, cx: &App) {
         let mut drafts = load_drafts(&self.key.guide_id);
         for thread in &self.note_threads {
             let thread = thread.read(cx);
+            if thread.finding().is_some() {
+                continue;
+            }
             let draft = thread.draft();
             if draft.replies.is_empty() {
                 drafts.remove(&thread.key());
@@ -718,6 +924,14 @@ impl Item for ChapterDiffView {
 
 impl Render for ChapterDiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let background = cx.theme().colors().editor_background;
+        if let Some(header) = self.render_findings_header(cx).map(IntoElement::into_any_element) {
+            return v_flex()
+                .size_full()
+                .bg(background)
+                .child(header)
+                .child(div().flex_1().min_h_0().child(self.editor.clone()));
+        }
         v_flex()
             .size_full()
             .bg(cx.theme().colors().editor_background)
