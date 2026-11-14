@@ -64,6 +64,9 @@ pub struct ThreadItem {
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
+    metadata_slot: Option<AnyElement>,
+    end_slot: Option<AnyElement>,
+    icon_tile: bool,
     base_bg: Option<Hsla>,
 }
 
@@ -99,6 +102,9 @@ impl ThreadItem {
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
+            metadata_slot: None,
+            end_slot: None,
+            icon_tile: false,
             base_bg: None,
         }
     }
@@ -243,6 +249,24 @@ impl ThreadItem {
         self
     }
 
+    /// Replaces the metadata line under the title.
+    pub fn metadata_slot(mut self, element: impl IntoElement) -> Self {
+        self.metadata_slot = Some(element.into_any_element());
+        self
+    }
+
+    /// Shown at the end of the title line, except while the action slot shows.
+    pub fn end_slot(mut self, element: impl IntoElement) -> Self {
+        self.end_slot = Some(element.into_any_element());
+        self
+    }
+
+    /// Draws the icon on a tile, in place of an icon character from the title.
+    pub fn icon_tile(mut self) -> Self {
+        self.icon_tile = true;
+        self
+    }
+
     pub fn base_bg(mut self, color: Hsla) -> Self {
         self.base_bg = Some(color);
         self
@@ -285,16 +309,27 @@ impl RenderOnce for ThreadItem {
 
         let icon_id = format!("icon-{}", self.id);
         let icon_visible = self.icon_visible;
+        let icon_tile = self.icon_tile;
+        let tile_background = color.element_background;
         let icon_container = || {
             h_flex()
                 .id(icon_id.clone())
-                .size_4()
                 .flex_none()
                 .justify_center()
+                .map(|this| {
+                    if icon_tile {
+                        this.size(px(20.))
+                            .rounded_sm()
+                            .items_center()
+                            .bg(tile_background)
+                    } else {
+                        this.size_4()
+                    }
+                })
                 .when(!icon_visible, |this| this.invisible())
         };
         let icon_color = self.icon_color.unwrap_or(Color::Muted);
-        let agent_icon = if let Some(icon_char) = self.icon_char {
+        let agent_icon = if let Some(icon_char) = self.icon_char.filter(|_| !icon_tile) {
             Label::new(icon_char)
                 .size(LabelSize::Small)
                 .color(icon_color)
@@ -354,6 +389,12 @@ impl RenderOnce for ThreadItem {
             icon_container().child(agent_icon).into_any_element()
         };
 
+        let shows_action = self.hovered && self.action_slot.is_some();
+        let end_slot = self.end_slot.filter(|_| !shows_action);
+        // The fade over a long title would also cover the end slot, so a row
+        // with one truncates its title instead.
+        let fade_title = opaque_window && end_slot.is_none();
+
         let title = self.title;
         let highlight_positions = self.highlight_positions;
 
@@ -374,12 +415,12 @@ impl RenderOnce for ThreadItem {
         } else if highlight_positions.is_empty() {
             Label::new(title)
                 .when_some(self.title_label_color, |label, color| label.color(color))
-                .when(!opaque_window, |label| label.truncate())
+                .when(!fade_title, |label| label.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(title, highlight_positions)
                 .when_some(self.title_label_color, |label, color| label.color(color))
-                .when(!opaque_window, |label| label.truncate())
+                .when(!fade_title, |label| label.truncate())
                 .into_any_element()
         };
 
@@ -421,11 +462,13 @@ impl RenderOnce for ThreadItem {
 
         let has_worktree = !linked_worktrees.is_empty();
 
-        let has_metadata = has_project_name
-            || has_project_paths
-            || has_worktree
-            || has_diff_stats
-            || has_timestamp;
+        let metadata_slot = self.metadata_slot;
+        let has_metadata = metadata_slot.is_none()
+            && (has_project_name
+                || has_project_paths
+                || has_worktree
+                || has_diff_stats
+                || has_timestamp);
 
         v_flex()
             .id(self.id.clone())
@@ -462,7 +505,10 @@ impl RenderOnce for ThreadItem {
                             .child(icon)
                             .child(title_label),
                     )
-                    .when(self.is_truncated && opaque_window, |this| {
+                    .when_some(end_slot, |this, slot| {
+                        this.child(h_flex().flex_none().pr_1().child(slot))
+                    })
+                    .when(self.is_truncated && fade_title, |this| {
                         this.child(gradient_overlay)
                     })
                     .when(self.hovered, |this| {
@@ -612,6 +658,15 @@ impl RenderOnce for ThreadItem {
                                     .color(Color::Muted),
                             )
                         }),
+                )
+            })
+            .when_some(metadata_slot, |this, slot| {
+                this.child(
+                    h_flex()
+                        .gap_1p5()
+                        .min_w_0()
+                        .child(div().flex_none().w(px(20.)))
+                        .child(div().flex_1().min_w_0().child(slot)),
                 )
             })
             .when(show_tooltip, |this| {

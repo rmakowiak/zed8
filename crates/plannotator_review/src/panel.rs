@@ -91,6 +91,19 @@ enum GateKind {
     Question,
 }
 
+impl GateKind {
+    /// The words after "Waits on you" in the threads sidebar.
+    fn short_label(&self) -> SharedString {
+        match self {
+            GateKind::Spec(session) if session.mode == "plan" => "Plan".into(),
+            GateKind::Spec(_) => "Spec".into(),
+            GateKind::Findings(_) => "Findings".into(),
+            GateKind::Results => "Test results".into(),
+            GateKind::Question => "Question".into(),
+        }
+    }
+}
+
 /// The state of a review action card.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ActionStatus {
@@ -850,6 +863,14 @@ impl ReviewPanel {
     /// only show in Needs you.
     fn handle_new_gates(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let gates = self.gates(cx);
+        thread_board::set_gates(
+            cx.entity_id(),
+            gates
+                .iter()
+                .filter_map(|gate| Some((gate.owner?, gate.kind.short_label())))
+                .collect(),
+            cx,
+        );
         let first = !self.handled_first_gates;
         self.handled_first_gates = true;
         let new: Vec<Gate> = gates.iter().filter(|gate| !self.known_gates.contains(&gate.key)).cloned().collect();

@@ -1,7 +1,7 @@
 # Zed8 changes to upstream files
 
 Zed8 is Zed (`zed-industries/zed`, branch `main`) plus the changes below.
-Most of Zed8 lives in new places: `crates/plannotator_review/` and `zed8/`.
+Most of Zed8 lives in new places: `crates/plannotator_review/`, `crates/thread_board/` and `zed8/`.
 Upstream never touches them, so they never conflict.
 
 The files in this list belong to upstream. A merge from upstream can
@@ -28,6 +28,12 @@ upstream file, add a row here in the same commit.
 | `crates/agent_ui/src/agent_panel.rs` | `AgentPanel::notify_terminal`, which calls `mark_terminal_notification` | A thread that waits on you gets the dot in the threads sidebar, the sound and the pop-up of a terminal bell. |
 | `crates/sidebar/src/sidebar.rs` | Worktree groups. See the list under the table. | The threads sidebar groups threads by worktree. This is the largest change to upstream code. |
 | `crates/sidebar/src/sidebar_tests.rs` | `test_threads_are_grouped_by_worktree` | Tests the grouping. |
+| `Cargo.toml` | `crates/thread_board` in `members` and in `[workspace.dependencies]` | Registers the thread board crate. |
+| `crates/zed/Cargo.toml` | `thread_board.workspace = true` | The app depends on the crate. |
+| `crates/zed/src/main.rs` | `thread_board::init(cx);` after `plannotator_review::init(cx);` | Starts the thread board store and its polling. |
+| `crates/ui/src/components/ai/thread_item.rs` | `ThreadItem::metadata_slot`, `ThreadItem::end_slot` and `ThreadItem::icon_tile`. A row with an end slot truncates its title instead of fading it (`fade_title`). | A terminal row shows its state line under the title, the elapsed time at the end of the title line, and a terminal icon on a tile. |
+| `crates/sidebar/Cargo.toml` | `thread_board.workspace = true` | The sidebar draws the thread board. |
+| `crates/sidebar/src/sidebar.rs` | Thread board hooks. See the second list under the table. | Each Claude Code terminal thread shows its state and tokens. |
 
 The sidebar change has these parts:
 
@@ -36,6 +42,14 @@ The sidebar change has these parts:
 - `render_worktree_heading`, and the heading and guide line in `render_list_entry`
 - no worktree chip on grouped rows, in `render_thread` and `render_terminal`
 - the heading flag in `EntryShape`
+
+The thread board hooks in `crates/sidebar/src/sidebar.rs`:
+
+- the `threads` field of `WorktreeHeading`, filled in `push_entries_by_display_time`
+- `thread_board::heading_badges` before the thread count in `render_worktree_heading`
+- `thread_board::decorate_row` in `render_terminal`
+- `thread_board::footer` in `render_sidebar_bottom_bar`, and `board_groups`
+- the observer of the board in `Sidebar::new`
 
 ## Build settings that are not in the code
 

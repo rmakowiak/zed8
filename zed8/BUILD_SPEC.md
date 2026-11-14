@@ -111,7 +111,7 @@ Build order:
 - Approve on a spec sends the answers and comments with the approval, in the same format as Send feedback. The Plannotator approve route accepts them.
 - Spec comments and their input use the layout of the diff review comments: the avatar, a row on the surface color, and Close and Add buttons.
 - A new spec round on a file dismisses an earlier session of that file that still waits (`POST /api/exit`), so its Claude stops waiting.
-- The threads sidebar groups the rows of a project by worktree when they come from more than one worktree. The worktree with the newest thread comes first. This change is in `crates/sidebar/src/sidebar.rs` (`push_entries_by_display_time`, `render_worktree_heading`).
+- The threads sidebar groups the rows of a project by worktree. Each worktree gets a heading, also when the project has only one worktree or one thread. The worktree with the newest thread comes first. This change is in `crates/sidebar/src/sidebar.rs` (`push_entries_by_display_time`, `render_worktree_heading`).
 - Plannotator keeps no record of earlier comments. Zed keeps the last sent round in `~/.plannotator/zed-drafts/` and compares it with the new text.
 - The browser fallback needs `PLANNOTATOR_BROWSER` set to `zed8/plannotator-browser` (see "Turn on the browser hook").
 

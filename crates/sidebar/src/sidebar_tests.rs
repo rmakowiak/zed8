@@ -7646,7 +7646,130 @@ async fn test_threads_are_grouped_by_worktree(cx: &mut TestAppContext) {
     });
     assert_eq!(
         headings,
-        vec![(1, "wt-feature-a".to_string()), (3, "wt-feature-b".to_string())]
+        vec![
+            (1, "wt-feature-a".to_string()),
+            (3, "wt-feature-b".to_string())
+        ]
+    );
+}
+
+fn worktree_heading_names(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut VisualTestContext,
+) -> Vec<(usize, String)> {
+    sidebar.read_with(cx, |sidebar, _| {
+        let mut headings: Vec<(usize, String)> = sidebar
+            .contents
+            .worktree_headings
+            .iter()
+            .map(|(ix, heading)| (*ix, heading.name.to_string()))
+            .collect();
+        headings.sort();
+        headings
+    })
+}
+
+#[gpui::test]
+async fn test_single_linked_worktree_gets_heading(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {},
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: std::path::PathBuf::from("/wt-feature-a"),
+            ref_name: Some("refs/heads/feature-a".into()),
+            sha: "aaa".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project = project::Project::test(fs.clone(), ["/wt-feature-a".as_ref()], cx).await;
+    project.update(cx, |p, cx| p.git_scans_complete(cx)).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("a")),
+        Some("A".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            //
+            "v [project]",
+            "  A {wt-feature-a}",
+        ]
+    );
+    assert_eq!(
+        worktree_heading_names(&sidebar, cx),
+        vec![(1, "wt-feature-a".to_string())]
+    );
+}
+
+#[gpui::test]
+async fn test_main_checkout_threads_get_heading(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {},
+            "src": {},
+        }),
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    project.update(cx, |p, cx| p.git_scans_complete(cx)).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("a")),
+        Some("A".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            //
+            "v [project]",
+            "  A",
+        ]
+    );
+    assert_eq!(
+        worktree_heading_names(&sidebar, cx),
+        vec![(1, "project".to_string())]
     );
 }
 

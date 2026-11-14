@@ -13526,6 +13526,7 @@ dependencies = [
  "terminal",
  "terminal_view",
  "theme",
+ "thread_board",
  "ui",
  "util",
  "workspace",
@@ -16657,6 +16658,7 @@ dependencies = [
  "telemetry",
  "theme",
  "theme_settings",
+ "thread_board",
  "ui",
  "unicode-segmentation",
  "util",
@@ -18245,6 +18247,24 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "thread_board"
+version = "0.1.0"
+dependencies = [
+ "agent_ui",
+ "anyhow",
+ "chrono",
+ "gpui",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "terminal",
+ "ui",
+ "util",
+ "workspace",
 ]
 
 [[package]]
@@ -22605,6 +22625,7 @@ dependencies = [
  "theme_extension",
  "theme_selector",
  "theme_settings",
+ "thread_board",
  "time",
  "time_format",
  "title_bar",

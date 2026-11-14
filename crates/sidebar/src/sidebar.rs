@@ -505,8 +505,7 @@ struct SidebarContents {
     notified_threads: HashSet<agent_ui::ThreadId>,
     notified_terminals: HashSet<TerminalId>,
     project_header_indices: Vec<usize>,
-    /// Worktree headings, by the index of the first entry under each. A
-    /// project group gets them when its threads run in more than one worktree.
+    /// Worktree headings, by the index of the first entry under each.
     worktree_headings: HashMap<usize, WorktreeHeading>,
     /// Rows under a worktree heading. They skip their own worktree chip.
     grouped_rows: HashSet<usize>,
@@ -520,6 +519,8 @@ struct WorktreeHeading {
     full_path: SharedString,
     /// The number of threads under the heading.
     count: usize,
+    /// Zed8: the terminal threads under the heading, for the thread board.
+    threads: Vec<thread_board::BoardThread>,
 }
 
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
@@ -971,6 +972,10 @@ impl Sidebar {
             }
             this.schedule_update_entries(false, cx);
         });
+
+        if let Some(board) = thread_board::ThreadBoard::global(cx) {
+            cx.observe(&board, |_, _, cx| cx.notify()).detach();
+        }
 
         Self {
             multi_workspace: multi_workspace.downgrade(),
@@ -2149,26 +2154,30 @@ impl Sidebar {
         &'a self,
         multi_workspace: &'a MultiWorkspace,
     ) -> impl Iterator<Item = EntryShape> + 'a {
-        self.contents.entries.iter().enumerate().map(move |(ix, entry)| match entry {
-            ListEntry::ProjectHeader {
-                key, has_threads, ..
-            } => EntryShape::ProjectHeader {
-                key: key.clone(),
-                has_threads: *has_threads,
-                is_collapsed: multi_workspace
-                    .group_state_by_key(key)
-                    .map(|state| !state.expanded)
-                    .unwrap_or(false),
-            },
-            ListEntry::Thread(thread) => EntryShape::Thread(
-                thread.metadata.thread_id,
-                self.contents.worktree_headings.contains_key(&ix),
-            ),
-            ListEntry::Terminal(terminal) => EntryShape::Terminal(
-                terminal.metadata.terminal_id,
-                self.contents.worktree_headings.contains_key(&ix),
-            ),
-        })
+        self.contents
+            .entries
+            .iter()
+            .enumerate()
+            .map(move |(ix, entry)| match entry {
+                ListEntry::ProjectHeader {
+                    key, has_threads, ..
+                } => EntryShape::ProjectHeader {
+                    key: key.clone(),
+                    has_threads: *has_threads,
+                    is_collapsed: multi_workspace
+                        .group_state_by_key(key)
+                        .map(|state| !state.expanded)
+                        .unwrap_or(false),
+                },
+                ListEntry::Thread(thread) => EntryShape::Thread(
+                    thread.metadata.thread_id,
+                    self.contents.worktree_headings.contains_key(&ix),
+                ),
+                ListEntry::Terminal(terminal) => EntryShape::Terminal(
+                    terminal.metadata.terminal_id,
+                    self.contents.worktree_headings.contains_key(&ix),
+                ),
+            })
     }
 
     /// Detects drafts that just went from empty back to having content and
@@ -2326,7 +2335,13 @@ impl Sidebar {
             div()
                 .w_full()
                 .pl(px(14.))
-                .child(div().w_full().border_l_1().border_color(line).child(rendered))
+                .child(
+                    div()
+                        .w_full()
+                        .border_l_1()
+                        .border_color(line)
+                        .child(rendered),
+                )
                 .into_any_element()
         } else {
             rendered
@@ -2352,8 +2367,8 @@ impl Sidebar {
         }
     }
 
-    /// The heading above the threads of one worktree: an icon tile, the
-    /// worktree name, its branch and the thread count.
+    /// The heading above the threads of one worktree: an icon, the worktree
+    /// name, its branch and the thread count.
     fn render_worktree_heading(ix: usize, heading: &WorktreeHeading, cx: &App) -> AnyElement {
         let colors = cx.theme().colors();
         h_flex()
@@ -2366,21 +2381,9 @@ impl Sidebar {
             .pb_1()
             .gap_1p5()
             .child(
-                div()
-                    .flex_none()
-                    .size(px(18.))
-                    .rounded_sm()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(colors.element_background)
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .child(
-                        Icon::new(IconName::GitWorktree)
-                            .size(IconSize::XSmall)
-                            .color(Color::Accent),
-                    ),
+                Icon::new(IconName::GitWorktree)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
             )
             .child(
                 Label::new(heading.name.clone())
@@ -2388,25 +2391,29 @@ impl Sidebar {
                     .weight(gpui::FontWeight::SEMIBOLD),
             )
             .child(
-                div().flex_1().min_w_0().when_some(heading.branch.clone(), |el, branch| {
-                    el.child(
-                        h_flex()
-                            .gap_0p5()
-                            .min_w_0()
-                            .child(
-                                Icon::new(IconName::GitBranch)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                Label::new(branch)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .truncate(),
-                            ),
-                    )
-                }),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .when_some(heading.branch.clone(), |el, branch| {
+                        el.child(
+                            h_flex()
+                                .gap_0p5()
+                                .min_w_0()
+                                .child(
+                                    Icon::new(IconName::GitBranch)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(branch)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                        )
+                    }),
             )
+            .children(thread_board::heading_badges(&heading.threads, cx))
             .child(
                 div()
                     .flex_none()
@@ -5945,10 +5952,9 @@ impl Sidebar {
         metadata.interacted_at.unwrap_or(metadata.updated_at)
     }
 
-    /// Pushes the rows of one project group, newest first. When the rows
-    /// come from more than one worktree, they are grouped by worktree: the
-    /// worktree with the newest row comes first, and the first row of each
-    /// worktree gets a heading.
+    /// Pushes the rows of one project group, newest first, grouped by
+    /// worktree: the worktree with the newest row comes first, and the first
+    /// row of each worktree gets a heading.
     fn push_entries_by_display_time(
         entries: &mut Vec<ListEntry>,
         terminals: Vec<TerminalEntry>,
@@ -5985,6 +5991,7 @@ impl Sidebar {
                 branch: join(&|worktree| worktree.branch_name.clone()),
                 full_path: join(&|worktree| Some(worktree.full_path.clone())).unwrap_or_default(),
                 count: 0,
+                threads: Vec::new(),
             }
         }
 
@@ -6008,17 +6015,22 @@ impl Sidebar {
                 None => groups.push((key, vec![entry])),
             }
         }
-        let show_headings = groups.len() > 1;
-
         for (mut heading, rows) in groups {
-            if show_headings {
-                heading.count = rows.len();
-                worktree_headings.insert(entries.len(), heading);
-            }
+            heading.count = rows.len();
+            heading.threads = rows
+                .iter()
+                .filter_map(|entry| match entry {
+                    ListEntry::Terminal(terminal) => Some(thread_board::BoardThread {
+                        terminal_id: terminal.metadata.terminal_id,
+                        title: terminal.metadata.display_title(),
+                        notified: terminal.has_notification,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            worktree_headings.insert(entries.len(), heading);
             for entry in rows {
-                if show_headings {
-                    grouped_rows.insert(entries.len());
-                }
+                grouped_rows.insert(entries.len());
                 if let ListEntry::Thread(thread) = &entry {
                     if let Some(session_id) = &thread.metadata.session_id {
                         current_session_ids.insert(session_id.clone());
@@ -6871,6 +6883,13 @@ impl Sidebar {
                     );
                 }
             }));
+
+        let terminal_item = thread_board::decorate_row(
+            terminal_item,
+            terminal.metadata.terminal_id,
+            terminal.has_notification,
+            cx,
+        );
 
         let context_menu_id = SharedString::from(format!("terminal-context-menu-{ix}"));
         let terminal_id = terminal.metadata.terminal_id;
@@ -7732,7 +7751,25 @@ impl Sidebar {
                     })),
             )
             .child(div().flex_1())
+            .when_some(
+                thread_board::footer(self.board_groups(), cx),
+                |this, footer| this.child(footer),
+            )
             .child(self.render_recent_projects_button(cx))
+    }
+
+    /// Zed8: the terminal threads of each worktree heading, for the thread board.
+    fn board_groups(&self) -> Vec<thread_board::BoardGroup> {
+        let mut headings: Vec<_> = self.contents.worktree_headings.iter().collect();
+        headings.sort_by_key(|(ix, _)| **ix);
+        headings
+            .into_iter()
+            .filter(|(_, heading)| !heading.threads.is_empty())
+            .map(|(_, heading)| thread_board::BoardGroup {
+                name: heading.name.clone(),
+                threads: heading.threads.clone(),
+            })
+            .collect()
     }
 
     fn active_workspace(&self, cx: &App) -> Option<Entity<Workspace>> {

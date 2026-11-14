@@ -4,6 +4,7 @@ Zed8 is Roman's personal build of [Zed](https://github.com/zed-industries/zed). 
 
 - A Review panel for Plannotator: guided code review of a PR, and spec review, inside Zed. See `BUILD_SPEC.md`.
 - Threads in the threads sidebar grouped by worktree.
+- A thread board in the threads sidebar: each Claude Code thread shows whether it waits on you, runs, is stuck or is done, with its tokens. See `THREAD_BOARD.md`.
 
 Later, it will also hold plugins for n8n work.
 
@@ -31,4 +32,4 @@ Ask Claude Code to run the `zed8-update` skill (`zed8/skills/zed8-update/SKILL.m
 
 ## License
 
-Zed is GPL-3. Zed8 keeps the licenses of Zed. The new crate `crates/plannotator_review` is GPL-3 too.
+Zed is GPL-3. Zed8 keeps the licenses of Zed. The new crates `crates/plannotator_review` and `crates/thread_board` are GPL-3 too.

@@ -1,0 +1,29 @@
+[package]
+name = "thread_board"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/thread_board.rs"
+doctest = false
+
+[dependencies]
+agent_ui.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+gpui.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+terminal.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
