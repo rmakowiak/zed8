@@ -44,6 +44,7 @@ pub use start::start_claude;
 
 pub fn init(cx: &mut App) {
     resume::init(cx);
+    chapter_view::bind_finding_keys(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         start::init(workspace);
         workspace

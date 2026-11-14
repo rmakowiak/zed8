@@ -20,9 +20,11 @@ use editor::{
 };
 use git_ui_core::file_diff_view::build_buffer_diff;
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font, FontWeight,
-    IntoElement, Render, SharedString, Subscription, Task, WeakEntity, Window, px,
+    Action, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font, FontWeight,
+    IntoElement, KeyBinding, Render, SharedString, Subscription, Task, WeakEntity, Window, actions, px,
 };
+use schemars::JsonSchema;
+use serde::Deserialize;
 use http_client::{HttpClient, Method};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use language::{Buffer, Capability, HighlightedText, OffsetRangeExt, Point};
@@ -35,13 +37,44 @@ use std::{
     process::Command,
     sync::Arc,
 };
-use ui::{Color, Icon, IconName, prelude::*};
+use ui::{Color, Icon, IconName, Tooltip, prelude::*};
 use util::{ResultExt as _, paths::PathStyle, rel_path::RelPath};
 use workspace::{
     Item, ItemHandle as _, ItemNavHistory, ToolbarItemLocation, Workspace,
     item::{ItemEvent, SaveOptions},
     searchable::SearchableItemHandle,
 };
+
+/// Jumps to an agent review finding by its number in the index.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = plannotator_review)]
+pub struct GoToFinding(pub usize);
+
+actions!(
+    plannotator_review,
+    [
+        /// Jumps to the next agent review finding.
+        NextFinding,
+        /// Jumps to the previous agent review finding.
+        PreviousFinding
+    ]
+);
+
+const FINDINGS_CONTEXT: &str = "PlannotatorFindings";
+
+/// Alt-1 to Alt-9 jump to findings 1 to 9. Alt-] and Alt-[ step through them.
+pub fn bind_finding_keys(cx: &mut App) {
+    let context = Some(FINDINGS_CONTEXT);
+    const KEYS: [&str; 9] = ["alt-1", "alt-2", "alt-3", "alt-4", "alt-5", "alt-6", "alt-7", "alt-8", "alt-9"];
+    let mut bindings: Vec<KeyBinding> = KEYS
+        .iter()
+        .enumerate()
+        .map(|(ix, key)| KeyBinding::new(key, GoToFinding(ix + 1), context))
+        .collect();
+    bindings.push(KeyBinding::new("alt-]", NextFinding, context));
+    bindings.push(KeyBinding::new("alt-[", PreviousFinding, context));
+    cx.bind_keys(bindings);
+}
 
 /// What a chapter view shows. Used to reuse an open tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +124,10 @@ pub struct ChapterDiffView {
     /// Inline comments in the editor, without the replies to notes.
     editor_comment_count: usize,
     note_threads: Vec<Entity<NoteThread>>,
+    /// Where each of `note_threads` sits in the diff.
+    note_anchors: Vec<Option<Anchor>>,
+    /// The last finding you jumped to, by its number.
+    current_finding: Option<usize>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -247,6 +284,8 @@ impl ChapterDiffView {
             path_keys,
             editor_comment_count: 0,
             note_threads: Vec::new(),
+            note_anchors: Vec::new(),
+            current_finding: None,
             _subscriptions: subscriptions,
         }
     }
@@ -276,9 +315,22 @@ impl ChapterDiffView {
     ) {
         let mut drafts = load_drafts(&self.key.guide_id);
         let mut blocks = Vec::with_capacity(placements.len());
+        let mut finding_count = 0;
         for (placement, file, note) in placements {
+            let anchor = match &placement {
+                BlockPlacement::Above(anchor) | BlockPlacement::Below(anchor) => Some(*anchor),
+                _ => None,
+            };
             let thread = match note.finding_id.clone() {
-                Some(id) => cx.new(|cx| NoteThread::new_finding(file, note, id, window, cx)),
+                Some(id) => {
+                    finding_count += 1;
+                    let index = finding_count;
+                    cx.new(|cx| {
+                        let mut thread = NoteThread::new_finding(file, note, id, window, cx);
+                        thread.set_index(index, cx);
+                        thread
+                    })
+                }
                 None => {
                     let draft = drafts
                         .remove(&note_thread::draft_key(&file, &note))
@@ -288,6 +340,7 @@ impl ChapterDiffView {
             };
             self.subscribe_thread(&thread, cx);
             self.note_threads.push(thread.clone());
+            self.note_anchors.push(anchor);
             blocks.push(BlockProperties {
                 placement,
                 // The editor measures the rendered thread and corrects the height.
@@ -419,6 +472,102 @@ impl ChapterDiffView {
         .detach();
     }
 
+    /// The inline findings in index order, with where each one sits.
+    fn indexed_findings(&self, cx: &App) -> Vec<(Entity<NoteThread>, Anchor)> {
+        self.note_threads
+            .iter()
+            .zip(&self.note_anchors)
+            .filter(|(thread, _)| thread.read(cx).finding().is_some())
+            .filter_map(|(thread, anchor)| Some((thread.clone(), (*anchor)?)))
+            .collect()
+    }
+
+    /// Scrolls to finding `index` (from 1) and puts the cursor on it.
+    fn go_to_finding(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let findings = self.indexed_findings(cx);
+        let Some((thread, anchor)) = index.checked_sub(1).and_then(|ix| findings.get(ix)).cloned() else {
+            return;
+        };
+        self.current_finding = Some(index);
+        thread.update(cx, |thread, cx| thread.expand(cx));
+        let rhs_editor = self.rhs_editor(cx);
+        rhs_editor.update(cx, |editor, cx| {
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::center()),
+                window,
+                cx,
+                |selections| selections.select_anchor_ranges([anchor..anchor]),
+            );
+        });
+        window.focus(&rhs_editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn step_finding(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.indexed_findings(cx).len();
+        if count == 0 {
+            return;
+        }
+        let next = match (self.current_finding, forward) {
+            (None, true) => 1,
+            (None, false) => count,
+            (Some(current), true) => current % count + 1,
+            (Some(current), false) => (current + count - 2) % count + 1,
+        };
+        self.go_to_finding(next, window, cx);
+    }
+
+    /// One numbered chip for each inline finding. A click jumps to it.
+    fn render_findings_index(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let findings = self.indexed_findings(cx);
+        if findings.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let (selected_bg, hover_bg, border) =
+            (colors.ghost_element_selected, colors.ghost_element_hover, colors.border_variant);
+        let chips = findings.iter().enumerate().map(|(ix, (thread, _))| {
+            let index = ix + 1;
+            let thread = thread.read(cx);
+            let deleted = thread.finding().is_some_and(|finding| finding.deleted);
+            let file = thread.file().rsplit('/').next().unwrap_or(thread.file()).to_string();
+            let shortcut = if index <= 9 { format!("  ⌥{index}") } else { String::new() };
+            let tooltip = format!("{}:{}\n{}{shortcut}", thread.file(), thread.line_start(), thread.first_line());
+            h_flex()
+                .id(("finding-index", ix))
+                .gap_1()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .border_1()
+                .border_color(border)
+                .cursor_pointer()
+                .when(self.current_finding == Some(index), |chip| chip.bg(selected_bg))
+                .hover(move |style| style.bg(hover_bg))
+                .tooltip(Tooltip::text(tooltip))
+                .child(Label::new(index.to_string()).size(LabelSize::XSmall).weight(FontWeight::SEMIBOLD).color(Color::Accent))
+                .child(
+                    Label::new(format!("{file}:{}", thread.line_start()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .when(deleted, |label| label.strikethrough()),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| this.go_to_finding(index, window, cx)))
+        });
+        Some(
+            v_flex()
+                .px_3()
+                .pb_2()
+                .gap_1()
+                .child(
+                    Label::new("INDEX · ⌥1–⌥9 JUMP · ⌥] NEXT · ⌥[ PREVIOUS")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(h_flex().flex_wrap().gap_1().children(chips)),
+        )
+    }
+
     fn render_findings_header(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let findings = self.findings.as_ref()?;
         let colors = cx.theme().colors();
@@ -475,6 +624,7 @@ impl ChapterDiffView {
                                 .on_click(cx.listener(|this, _, window, cx| this.send_findings(true, window, cx))),
                         ),
                 )
+                .children(self.render_findings_index(cx))
                 .when(!findings.general.is_empty(), |header| {
                     header.child(
                         v_flex()
@@ -927,6 +1077,14 @@ impl Render for ChapterDiffView {
         let background = cx.theme().colors().editor_background;
         if let Some(header) = self.render_findings_header(cx).map(IntoElement::into_any_element) {
             return v_flex()
+                .key_context(FINDINGS_CONTEXT)
+                .on_action(cx.listener(|this, action: &GoToFinding, window, cx| {
+                    this.go_to_finding(action.0, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &NextFinding, window, cx| this.step_finding(true, window, cx)))
+                .on_action(cx.listener(|this, _: &PreviousFinding, window, cx| {
+                    this.step_finding(false, window, cx)
+                }))
                 .size_full()
                 .bg(background)
                 .child(header)

@@ -32,6 +32,7 @@ menu.workspace = true
 multi_buffer.workspace = true
 notifications.workspace = true
 project.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true

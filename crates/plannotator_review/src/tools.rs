@@ -13,7 +13,11 @@
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
-use std::{collections::BTreeSet, path::Path, process::Command};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 pub const PREVIEW_LABEL: &str = "cloud-preview";
 const FLAG_PREFIX: &str = "flag:";
@@ -278,20 +282,67 @@ fn natural_key(key: &str) -> (u64, String) {
 /// whether something listens on it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalN8n {
+    /// The n8n-wt worktree name, for `n8n-wt <command> <name>`.
+    pub name: String,
+    /// The worktree folder, which holds `env.sh` and `meta.json`.
+    pub dir: PathBuf,
+    pub port: u16,
+    pub running: bool,
+    /// The shared telemetry capture, when the worktree sends to it.
+    pub telemetry: Option<TelemetryCapture>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TelemetryCapture {
     pub port: u16,
     pub running: bool,
 }
 
-pub fn local_n8n(root: &Path) -> Option<LocalN8n> {
-    let meta = root.parent()?.join("meta.json");
-    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(meta).ok()?).ok()?;
-    let port = u16::try_from(meta.get("ports")?.get("n8n")?.as_u64()?).ok()?;
-    let running = std::net::TcpStream::connect_timeout(
+impl LocalN8n {
+    /// The same label as the `dev:be` task that n8n-wt writes to
+    /// `.zed/tasks.json`, so Zed treats both as one task.
+    pub fn backend_task_label(&self) -> String {
+        format!("n8n-wt: dev:be ({})", self.name)
+    }
+
+    pub fn backend_command(&self) -> String {
+        let env = self.dir.join("env.sh");
+        let env = env.to_string_lossy();
+        format!("source '{}' && pnpm dev:be", env.replace('\'', "'\\''"))
+    }
+
+    /// Starts the shared capture if it is down, then opens its TUI with only
+    /// the events of this worktree's n8n.
+    pub fn telemetry_command(&self) -> String {
+        let name = format!("'{}'", self.name.replace('\'', "'\\''"));
+        format!("n8n-wt telemetry up && exec n8n-wt telemetry tail {name}")
+    }
+}
+
+fn port_is_open(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         std::time::Duration::from_millis(200),
     )
-    .is_ok();
-    Some(LocalN8n { port, running })
+    .is_ok()
+}
+
+pub fn local_n8n(root: &Path) -> Option<LocalN8n> {
+    let dir = root.parent()?.to_path_buf();
+    let meta = dir.join("meta.json");
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(meta).ok()?).ok()?;
+    let ports = meta.get("ports")?;
+    let port = u16::try_from(ports.get("n8n")?.as_u64()?).ok()?;
+    let name = meta.get("name")?.as_str()?.to_string();
+    let telemetry = meta
+        .get("telemetry")
+        .and_then(|telemetry| telemetry.as_bool())
+        .unwrap_or(false)
+        .then(|| ports.get("telemetry")?.as_u64())
+        .flatten()
+        .and_then(|port| u16::try_from(port).ok())
+        .map(|port| TelemetryCapture { port, running: port_is_open(port) });
+    Some(LocalN8n { name, dir, port, running: port_is_open(port), telemetry })
 }
 
 #[cfg(test)]
@@ -330,5 +381,42 @@ mod tests {
         let mut keys = vec!["99_x", "136_skill_sync", "mcp"];
         keys.sort_by_key(|key| std::cmp::Reverse(natural_key(key)));
         assert_eq!(keys, vec!["136_skill_sync", "99_x", "mcp"]);
+    }
+
+    #[test]
+    fn reads_the_worktree_and_its_telemetry_capture() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let write_meta = |telemetry: bool| {
+            let meta = serde_json::json!({
+                "name": "context-433",
+                "telemetry": telemetry,
+                "ports": { "n8n": 1, "telemetry": 2 },
+            });
+            std::fs::write(dir.path().join("meta.json"), meta.to_string())
+        };
+        let root = dir.path().join("n8n");
+
+        write_meta(true)?;
+        let local = local_n8n(&root).context("no local n8n")?;
+        assert_eq!(local.name, "context-433");
+        assert_eq!(local.telemetry.map(|capture| capture.port), Some(2));
+
+        write_meta(false)?;
+        assert_eq!(local_n8n(&root).context("no local n8n")?.telemetry, None);
+
+        let local = LocalN8n {
+            name: "it's".to_string(),
+            dir: PathBuf::from("/wt/it's"),
+            port: 1,
+            running: false,
+            telemetry: None,
+        };
+        assert_eq!(
+            local.telemetry_command(),
+            "n8n-wt telemetry up && exec n8n-wt telemetry tail 'it'\\''s'"
+        );
+        assert_eq!(local.backend_task_label(), "n8n-wt: dev:be (it's)");
+        assert_eq!(local.backend_command(), "source '/wt/it'\\''s/env.sh' && pnpm dev:be");
+        Ok(())
     }
 }

@@ -38,13 +38,13 @@ cp "$bin/cli" "$app/Contents/MacOS/cli"
 [ -x /Applications/Zed.app/Contents/MacOS/git ] && cp /Applications/Zed.app/Contents/MacOS/git "$app/Contents/MacOS/git"
 cp crates/zed/resources/Document.icns "$app/Contents/Resources/Document.icns"
 
-# The icon: the dev icon, so Zed8 and official Zed look different in the Dock.
+# The icon: the nightly icon, so Zed8 and official Zed look different in the Dock.
 iconset="$CARGO_TARGET_DIR/Zed8.iconset"
 rm -rf "$iconset" && mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
-    sips -z $size $size crates/zed/resources/app-icon-dev@2x.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    sips -z $size $size crates/zed/resources/app-icon-nightly@2x.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
     double=$((size * 2))
-    sips -z $double $double crates/zed/resources/app-icon-dev@2x.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+    sips -z $double $double crates/zed/resources/app-icon-nightly@2x.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/Zed8.icns"
 

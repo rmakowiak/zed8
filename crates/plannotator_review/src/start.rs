@@ -133,6 +133,48 @@ pub fn start_claude(
     crate::show_toast(workspace, "Started Claude Code in a new terminal.", cx);
 }
 
+/// Runs `command` through the system shell in a new terminal tab of the
+/// worktree. It takes the workspace entity, not `&mut Workspace`, because
+/// `TerminalPanel::spawn_task` reads the workspace, and GPUI panics on a read
+/// of an entity that is being updated.
+///
+/// With `single`, a second run waits for the running one and then reuses its
+/// terminal, so a double click never starts the command twice.
+pub fn run_in_terminal(
+    workspace: &Entity<Workspace>,
+    label: &str,
+    command: String,
+    single: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (panel, cwd) = workspace.read_with(cx, |workspace, cx| {
+        (
+            workspace.panel::<TerminalPanel>(cx),
+            crate::worktree_roots(workspace, cx).into_iter().next(),
+        )
+    });
+    let Some(panel) = panel else {
+        workspace.update(cx, |workspace, cx| {
+            crate::show_toast(workspace, "Zed cannot open a terminal in this project.", cx)
+        });
+        return;
+    };
+    let task = SpawnInTerminal {
+        label: label.to_string(),
+        full_label: if single { label.to_string() } else { command.clone() },
+        command_label: command.clone(),
+        command: Some(command),
+        cwd,
+        use_new_terminal: !single,
+        allow_concurrent_runs: !single,
+        reveal: RevealStrategy::Always,
+        ..SpawnInTerminal::default()
+    };
+    let spawn = panel.update(cx, |panel, cx| panel.spawn_task(&task, window, cx));
+    cx.spawn(async move |_| spawn.await.log_err()).detach();
+}
+
 /// A terminal that runs Claude Code.
 #[derive(Clone)]
 pub(crate) struct ClaudeTerminal {

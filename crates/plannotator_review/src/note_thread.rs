@@ -47,6 +47,8 @@ pub struct NoteThread {
     input: Entity<Editor>,
     _input_subscriptions: [Subscription; 2],
     finding: Option<Finding>,
+    /// The number of the finding in the index of the findings tab.
+    index: Option<usize>,
     editing: bool,
 }
 
@@ -80,6 +82,7 @@ impl NoteThread {
             input,
             _input_subscriptions: input_subscriptions,
             finding: None,
+            index: None,
             editing: false,
         }
     }
@@ -99,6 +102,31 @@ impl NoteThread {
 
     pub fn finding(&self) -> Option<&Finding> {
         self.finding.as_ref()
+    }
+
+    pub fn set_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.index = Some(index);
+        cx.notify();
+    }
+
+    pub fn file(&self) -> &str {
+        &self.file
+    }
+
+    pub fn line_start(&self) -> u32 {
+        self.note.line_start
+    }
+
+    /// The first line of the note, for the index of the findings tab.
+    pub fn first_line(&self) -> &str {
+        self.note.text.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim()
+    }
+
+    pub fn expand(&mut self, cx: &mut Context<Self>) {
+        if self.collapsed {
+            self.collapsed = false;
+            cx.notify();
+        }
     }
 
     /// The finding as you want it sent, or `None` when you deleted it.
@@ -298,11 +326,17 @@ impl Render for NoteThread {
                 .color(Color::Muted),
             )
             .child(
-                Label::new(match &self.finding {
-                    Some(finding) if finding.deleted => "✦ Agent review · deleted",
-                    Some(finding) if finding.edited => "✦ Agent review · edited by you",
-                    Some(_) => "✦ Agent review",
-                    None => "✦ Claude note",
+                Label::new({
+                    let label = match &self.finding {
+                        Some(finding) if finding.deleted => "Agent review · deleted",
+                        Some(finding) if finding.edited => "Agent review · edited by you",
+                        Some(_) => "Agent review",
+                        None => "Claude note",
+                    };
+                    match self.index {
+                        Some(index) => format!("✦ {index} · {label}"),
+                        None => format!("✦ {label}"),
+                    }
                 })
                 .size(LabelSize::Small)
                 .weight(FontWeight::SEMIBOLD)
