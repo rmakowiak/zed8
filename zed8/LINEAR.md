@@ -2,7 +2,7 @@
 
 This plan adds Linear to Zed8 and replaces the Bash tool `n8n-wt` with a Rust crate, `n8n_worktree_manager`. Zed8 uses the crate as a library. The terminal and Raycast Workbench use its binary, `n8n-worktree-manager`.
 
-Status (2026-11-15): phases 1, 2 and 4 are built, and phase 3 (cutover) is done up to the app install. The crate `crates/n8n_worktree_manager` has 36 tests, all green, and clippy is clean. Phase 5 (Zed8 Work panel) is next.
+Status (2026-11-15): phases 1, 2 and 4 are built, and phase 3 (cutover) is done up to the app install. The crate `crates/n8n_worktree_manager` has 40 tests, all green, and clippy is clean. Phase 5 (Zed8 Work panel) is next.
 
 Backlog of ideas from the review: the Apple Notes note "Zed8 backlog".
 
@@ -190,4 +190,6 @@ Cutover (phase 3), 2026-11-15:
 - Raycast `go.ts` runs `n8n-worktree-manager create <name> --branch <branch> --open --notify`, and `worktrees.ts` reads `list --json`. The change takes effect after `npm run dev` in `raycast/`.
 - `create --branch` now covers `go`. It returns the worktree whose checkout is on the branch (read from git, not meta.json), and it fetches over the HTTPS URL of origin, because a Raycast shell has no SSH key. `--notify` (any command) shows a macOS notification at the end.
 - Old calls keep working: `ls`, `rm`, `down`, `create --skip-build`, `create --no-open`. `open` has no `-e`, so it focuses the window of the worktree and never replaces the project of the front window.
-- Left: the app install (quit Zed8), `npm run dev` for Raycast, and `LINEAR_API_KEY` in `secrets.env`.
+- Done on 2026-11-15: the app install, the Raycast build, and `LINEAR_API_KEY`. `linear issues` works against the real Linear.
+
+Prune (2026-11-15): `prune --merged` lists the worktrees whose branch (read from git) has a merged PR in n8n-io/n8n, asks once, and tears down the safe ones. It skips a worktree with uncommitted or untracked files (the reason names them), and one whose HEAD is not an ancestor of the merged PR head. A worktree without a checkout holds only generated files, so it is safe. `--json` only lists. `teardown` now finds the source repo with `git rev-parse --git-common-dir` in the checkout, because 3 worktrees had a `source_repo` in meta.json that no longer exists. A background job that only notifies is still in the backlog. The first real prune (8 worktrees) removed folders and git worktrees, but `docker compose down` failed: this Mac has only the standalone `docker-compose`. The containers and volumes were removed by hand. `Settings::load` now checks `docker compose version` and falls back to `docker-compose`, like the Bash `COMPOSE_BIN`.

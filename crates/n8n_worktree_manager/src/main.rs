@@ -52,6 +52,22 @@ enum Commands {
     },
     /// Focus the Zed window of the worktree, or open a new window.
     Open { name: String },
+    /// Tear down the worktrees whose PR is merged. Skips a worktree with
+    /// uncommitted changes or with commits that are not in the merged PR.
+    Prune {
+        /// Required, so a bare `prune` from the old tool does nothing by surprise.
+        #[arg(long, required = true)]
+        merged: bool,
+        /// Also delete the local branches.
+        #[arg(long)]
+        delete_branch: bool,
+        /// Skip the question.
+        #[arg(long)]
+        yes: bool,
+        /// Only list, as JSON. Tears nothing down.
+        #[command(flatten)]
+        json: JsonFlag,
+    },
     /// Stop the containers, delete the database, remove the git worktree and the folder.
     #[command(aliases = ["rm", "down"])]
     Teardown {
@@ -401,6 +417,64 @@ fn run(manager: &Manager, command: Commands) -> Result<()> {
             }
             Ok(())
         }
+        Commands::Prune {
+            merged: _,
+            delete_branch,
+            yes,
+            json,
+        } => {
+            let merged = manager.merged()?;
+            if json.json {
+                return print_json(
+                    &json!({ "schema_version": SCHEMA_VERSION, "merged": merged }),
+                );
+            }
+            if merged.is_empty() {
+                println!("No worktree has a merged PR.");
+                return Ok(());
+            }
+            for worktree in &merged {
+                let note = match &worktree.skip {
+                    Some(reason) => format!("skip: {reason}"),
+                    None => "tear down".to_string(),
+                };
+                println!(
+                    "{:<24} #{:<6} {:<40} {note}",
+                    worktree.name, worktree.pr, worktree.branch
+                );
+            }
+            let safe: Vec<_> = merged.iter().filter(|worktree| worktree.skip.is_none()).collect();
+            if safe.is_empty() {
+                println!("Nothing to tear down.");
+                return Ok(());
+            }
+            if !yes
+                && !confirm(&format!(
+                    "Tear down {} worktree(s)? This deletes their databases and folders.",
+                    safe.len()
+                ))?
+            {
+                bail!("Aborted. Pass --yes to skip the question.");
+            }
+            let options = TeardownOptions {
+                force: false,
+                delete_branch,
+            };
+            let mut failed = 0;
+            for worktree in safe {
+                match manager.teardown(&worktree.name, options) {
+                    Ok(()) => eprintln!("Tore down '{}'", worktree.name),
+                    Err(error) => {
+                        failed += 1;
+                        eprintln!("error: '{}': {error:#}", worktree.name);
+                    }
+                }
+            }
+            if failed > 0 {
+                bail!("{failed} teardown(s) failed");
+            }
+            Ok(())
+        }
         Commands::Open { name } => open(manager, &name),
         Commands::Teardown {
             name,
@@ -592,9 +666,13 @@ fn telemetry_tail(manager: &Manager, name: Option<String>) -> Result<()> {
     ]);
     if let Some(name) = name {
         let meta = manager.show(&name)?;
-        let output = std::process::Command::new("docker")
+        let compose = &manager.settings().compose_command;
+        let (program, compose_args) = compose
+            .split_first()
+            .context("no compose command in the settings")?;
+        let output = std::process::Command::new(program)
+            .args(compose_args)
             .args([
-                "compose",
                 "exec",
                 "-T",
                 "postgres",

@@ -274,6 +274,10 @@ fn teardown_removes_containers_worktree_and_folder_and_frees_the_slot() {
             format!("git -C {} status --porcelain", checkout.display()),
             "docker compose -p n8n-wt-feature-one down -v --remove-orphans".to_string(),
             format!(
+                "git -C {} rev-parse --path-format=absolute --git-common-dir",
+                checkout.display()
+            ),
+            format!(
                 "git -C {source} worktree remove {} --force",
                 checkout.display()
             ),
@@ -588,5 +592,147 @@ fn create_fetches_over_https_because_a_raycast_shell_has_no_ssh_key() {
                 "git -C {source} fetch --quiet https://github.com/n8n-io/n8n.git +refs/heads/master:refs/remotes/origin/master"
             ),
         ]
+    );
+}
+
+#[test]
+fn merged_lists_worktrees_with_a_merged_pr_and_skips_unsafe_ones() {
+    let setup = setup();
+    for name in ["clean", "dirty", "ahead", "open-pr", "orphan"] {
+        setup
+            .manager
+            .create(CreateOptions::new(name))
+            .expect("create");
+    }
+    let checkout = |name: &str| setup.wt_home.join(format!("n8n/{name}/n8n")).display().to_string();
+    // The orphan lost its checkout: its folder holds only generated files.
+    for name in ["clean", "dirty", "ahead", "open-pr"] {
+        fs::create_dir_all(checkout(name)).expect("checkout");
+    }
+    let merged_pr = |number: u32, head: &str| {
+        Output::ok(&format!(
+            r#"[{{"number":{number},"headRefOid":"{head}","url":"https://github.com/n8n-io/n8n/pull/{number}"}}]"#
+        ))
+    };
+    for (branch, number, head) in [
+        ("clean", 1, "aaa"),
+        ("dirty", 2, "bbb"),
+        ("ahead", 3, "ccc"),
+        ("orphan", 4, "ddd"),
+    ] {
+        setup.system.respond(
+            &format!("gh pr list --repo n8n-io/n8n --head {branch} --state merged"),
+            merged_pr(number, head),
+        );
+    }
+    setup.system.respond(
+        &format!("git -C {} status --porcelain", checkout("dirty")),
+        Output::ok(" M packages/cli/src/index.ts\n?? dev-be.log\n"),
+    );
+    setup.system.fail(&format!(
+        "git -C {} merge-base --is-ancestor HEAD ccc",
+        checkout("ahead")
+    ));
+
+    let merged = setup.manager.merged().expect("merged");
+
+    let summary: Vec<(String, u32, Option<String>)> = merged
+        .into_iter()
+        .map(|worktree| (worktree.name, worktree.pr, worktree.skip))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("ahead".to_string(), 3, Some("commits that are not in the merged PR".to_string())),
+            ("clean".to_string(), 1, None),
+            (
+                "dirty".to_string(),
+                2,
+                Some("uncommitted changes: packages/cli/src/index.ts, dev-be.log".to_string())
+            ),
+            ("orphan".to_string(), 4, None),
+        ]
+    );
+}
+
+#[test]
+fn teardown_without_a_checkout_skips_git_and_removes_the_folder() {
+    let setup = setup();
+    setup
+        .manager
+        .create(CreateOptions::new("orphan"))
+        .expect("create");
+    let dir = setup.wt_home.join("n8n/orphan");
+    setup.system.clear_commands();
+
+    setup
+        .manager
+        .teardown("orphan", TeardownOptions::default())
+        .expect("teardown");
+
+    assert_eq!(
+        setup.system.commands(),
+        ["docker compose -p n8n-wt-orphan down -v --remove-orphans"]
+    );
+    assert!(!dir.exists());
+}
+
+#[test]
+fn teardown_finds_the_source_repo_from_the_checkout_not_from_a_stale_meta() {
+    let setup = setup();
+    setup
+        .manager
+        .create(CreateOptions::new("feature-one"))
+        .expect("create");
+    let checkout = setup.wt_home.join("n8n/feature-one/n8n");
+    fs::create_dir_all(&checkout).expect("checkout");
+    setup.system.respond(
+        &format!(
+            "git -C {} rev-parse --path-format=absolute --git-common-dir",
+            checkout.display()
+        ),
+        Output::ok("/real/n8n/.git\n"),
+    );
+    setup.system.clear_commands();
+
+    setup
+        .manager
+        .teardown("feature-one", TeardownOptions::default())
+        .expect("teardown");
+
+    assert!(setup.system.commands().contains(&format!(
+        "git -C /real/n8n worktree remove {} --force",
+        checkout.display()
+    )));
+}
+
+#[test]
+fn a_mac_with_only_the_standalone_docker_compose_uses_it() {
+    let home = tempfile::tempdir().expect("temp dir");
+    let mut settings = Settings::new(home.path().join("wt"), Secrets::default());
+    settings.default_source_repo = home.path().join("n8n");
+    fs::create_dir_all(home.path().join("n8n/packages/cli")).expect("source repo");
+    fs::write(home.path().join("n8n/pnpm-workspace.yaml"), "").expect("source repo");
+    settings.compose_command = vec!["docker-compose".to_string()];
+    let system = Arc::new(FakeSystem::default());
+    let manager = Manager::new(settings, system.clone());
+    manager
+        .create(CreateOptions::new("feature-one"))
+        .expect("create");
+    manager.provision("feature-one").expect("provision");
+
+    manager
+        .teardown("feature-one", TeardownOptions::default())
+        .expect("teardown");
+
+    let compose: Vec<String> = system
+        .commands()
+        .into_iter()
+        .filter(|line| line.contains("compose") && !line.starts_with("git"))
+        .collect();
+    assert!(!compose.is_empty());
+    assert!(
+        compose.iter().all(|line| line.starts_with("docker-compose ")),
+        "{compose:#?}"
     );
 }

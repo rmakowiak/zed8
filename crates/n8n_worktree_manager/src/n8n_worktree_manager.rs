@@ -1,6 +1,7 @@
 pub mod linear;
 pub mod model;
 mod provision;
+pub mod prune;
 pub mod render;
 pub mod services;
 pub mod settings;
@@ -83,6 +84,17 @@ impl Manager {
             store,
             system,
         }
+    }
+
+    /// `docker compose` or `docker-compose`, from the settings.
+    pub fn compose(&self) -> Command {
+        let (program, args) = self
+            .settings
+            .compose_command
+            .split_first()
+            .map(|(program, args)| (program.as_str(), args))
+            .unwrap_or(("docker", &[]));
+        Command::new(program).args(args.iter().cloned())
     }
 
     pub fn settings(&self) -> &Settings {
@@ -338,6 +350,30 @@ impl Manager {
         Ok(meta)
     }
 
+    /// The repo that holds the git data of a checkout. It asks git first,
+    /// because `source_repo` in meta.json can name a repo that is gone.
+    fn source_repo_of(&self, checkout: &Path, meta: &Meta) -> PathBuf {
+        if checkout.is_dir() {
+            let output = self.system.run(
+                &Command::new("git")
+                    .arg("-C")
+                    .arg(checkout.to_string_lossy())
+                    .args(["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+            );
+            match output {
+                Ok(output) if output.success => {
+                    let common_dir = output.stdout.trim();
+                    if let Some(repo) = common_dir.strip_suffix("/.git") {
+                        return PathBuf::from(repo);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("warning: {error:#}"),
+            }
+        }
+        PathBuf::from(&meta.source_repo)
+    }
+
     /// The worktree whose checkout is on `branch`. It reads git, not
     /// meta.json, because the branch can change after create.
     fn find_by_branch(&self, branch: &str) -> Result<Option<Meta>> {
@@ -413,8 +449,7 @@ impl Manager {
             }
         }
         // By project name, so it also works when docker-compose.yml is gone.
-        let down = Command::new("docker").args([
-            "compose",
+        let down = self.compose().args([
             "-p",
             &render::compose_project(&meta.name),
             "down",
@@ -424,8 +459,8 @@ impl Manager {
         if let Err(error) = self.run(&down) {
             eprintln!("warning: {error:#}");
         }
-        let source_repo = PathBuf::from(&meta.source_repo);
-        if checkout.is_dir() && !meta.source_repo.is_empty() {
+        let source_repo = self.source_repo_of(&checkout, &meta);
+        if checkout.is_dir() && !source_repo.as_os_str().is_empty() {
             let checkout_text = checkout.to_string_lossy().into_owned();
             if let Err(error) = self.run(&git_in(
                 &source_repo,
@@ -434,7 +469,7 @@ impl Manager {
                 eprintln!("warning: {error:#}");
             }
         }
-        if options.delete_branch && !meta.source_repo.is_empty() {
+        if options.delete_branch && !source_repo.as_os_str().is_empty() {
             if let Err(error) = self.run(&git_in(&source_repo, &["branch", "-D", &meta.branch])) {
                 eprintln!("warning: {error:#}");
             }

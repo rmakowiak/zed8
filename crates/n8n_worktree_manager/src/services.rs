@@ -82,7 +82,7 @@ impl crate::Manager {
             "sandbox" => {
                 let dir = self.settings.shared_dir("sandbox");
                 if dir.join("docker-compose.yml").is_file() {
-                    self.run(&Command::new("docker").args(["compose", "stop"]).cwd(dir))?;
+                    self.run(&self.compose().arg("stop").cwd(dir))?;
                 }
                 Ok(())
             }
@@ -261,16 +261,18 @@ impl crate::Manager {
             ]))?;
         }
         self.run(
-            &Command::new("docker")
-                .args(["compose", "up", "-d"])
+            &self
+                .compose()
+                .args(["up", "-d"])
                 .cwd(&dir),
         )?;
         if self.sandbox_ready()? {
             return Ok(());
         }
         let runner = self.run(
-            &Command::new("docker")
-                .args(["compose", "ps", "-q", "sandbox-runner-1"])
+            &self
+                .compose()
+                .args(["ps", "-q", "sandbox-runner-1"])
                 .cwd(&dir),
         )?;
         let runner = runner.trim().to_string();

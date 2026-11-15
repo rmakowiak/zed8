@@ -56,6 +56,9 @@ fn unquote(value: &str) -> &str {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub wt_home: PathBuf,
+    /// `docker compose` (the plugin), or `docker-compose` on a Mac that has
+    /// only the standalone binary. `load` checks which one works.
+    pub compose_command: Vec<String>,
     pub default_source_repo: PathBuf,
     pub owner_email: String,
     pub owner_first_name: String,
@@ -130,6 +133,7 @@ impl Settings {
             zed_cli: value("N8N_WT_ZED_CLI", &default_zed_cli(&home)),
             linear_workspace: value("LINEAR_WORKSPACE", "n8n"),
             node_bin_dir: value("NODE_BIN_DIR", ""),
+            compose_command: vec!["docker".to_string(), "compose".to_string()],
             wt_home,
         }
     }
@@ -155,7 +159,9 @@ impl Settings {
                 secrets.0.insert(key.to_string(), value);
             }
         }
-        Self::new(wt_home, secrets)
+        let mut settings = Self::new(wt_home, secrets);
+        settings.compose_command = detect_compose_command();
+        settings
     }
 
     /// The folder that holds one folder per worktree.
@@ -174,4 +180,23 @@ impl Settings {
     pub fn shared_dir(&self, service: &str) -> PathBuf {
         self.wt_home.join("shared").join(service)
     }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "blocking on purpose: a quick probe once at start, before any work"
+)]
+fn detect_compose_command() -> Vec<String> {
+    let works = |program: &str, args: &[&str]| {
+        std::process::Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if !works("docker", &["compose", "version"]) && works("docker-compose", &["version"]) {
+        return vec!["docker-compose".to_string()];
+    }
+    vec!["docker".to_string(), "compose".to_string()]
 }

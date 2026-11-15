@@ -120,7 +120,7 @@ impl Manager {
     }
 
     pub(crate) fn compose_up(&self, meta: &Meta) -> Result<String> {
-        let mut command = Command::new("docker").arg("compose");
+        let mut command = self.compose();
         if meta.queue {
             command = command.args(["--profile", "queue"]);
         }
@@ -132,9 +132,9 @@ impl Manager {
     }
 
     fn wait_for_postgres(&self, dir: &Path) -> Result<String> {
-        let command = Command::new("docker")
+        let command = self
+            .compose()
             .args([
-                "compose",
                 "exec",
                 "-T",
                 "postgres",
