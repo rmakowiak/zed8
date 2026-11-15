@@ -47,6 +47,7 @@ mkdir -p "$HOME/Applications"
 cp -R "$new_app" $HOME/Applications/Zed8.app
 mkdir -p "$HOME/.local/bin" "$HOME/Applications"
 ln -sf $HOME/Applications/Zed8.app/Contents/MacOS/cli "$HOME/.local/bin/zed8"
+ln -sf $HOME/Applications/Zed8.app/Contents/MacOS/n8n-worktree-manager "$HOME/.local/bin/n8n-worktree-manager"
 
 echo "$(date): opening Zed8"
 open -a $HOME/Applications/Zed8.app

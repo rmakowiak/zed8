@@ -1,0 +1,59 @@
+[
+  {
+    "label": "n8n-wt: dev:be (alpha)",
+    "command": "source \"/wt/n8n/alpha/env.sh\" && pnpm dev:be",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "n8n-wt: dev:fe:editor (alpha)",
+    "command": "source \"/wt/n8n/alpha/env.sh\" && pnpm dev:fe:editor",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "n8n-wt: test:backend:unit (alpha)",
+    "command": "source \"/wt/n8n/alpha/env.sh\" && pnpm test:ci:backend:unit",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "n8n-wt: test:backend:integration (alpha)",
+    "command": "source \"/wt/n8n/alpha/env.sh\" && pnpm test:ci:backend:integration",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "n8n-wt: test:frontend (alpha)",
+    "command": "source \"/wt/n8n/alpha/env.sh\" && pnpm test:ci:frontend",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "n8n-wt: build (alpha)",
+    "command": "source \"/wt/n8n/alpha/env.sh\" && pnpm build",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "n8n-wt: lazysql (alpha)",
+    "command": "lazysql \"postgres://postgres:password@localhost:25435/n8n?sslmode=disable\"",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "n8n-wt: lazydocker (alpha)",
+    "command": "lazydocker",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "cwd": "/wt/n8n/alpha"
+  }
+]

@@ -1,0 +1,53 @@
+services:
+  # A single shared AI sandbox — n8n's backend runs on the host regardless
+  # of which worktree it's serving, so every worktree with --sandbox just
+  # points N8N_SANDBOX_SERVICE_URL at this one instance. Service names
+  # double as the network aliases the images expect (sandbox-api,
+  # sandbox-runner-1) — the mTLS certs' SAN entries are bound to exactly
+  # these hostnames. Managed by `n8n-wt sandbox up/down/destroy/status`,
+  # not by `create`/`teardown`.
+  sandbox-api:
+    image: ${SANDBOX_API_IMAGE}
+    restart: unless-stopped
+    ports:
+      - '${SHARED_SANDBOX_PORT}:8080'
+    volumes:
+      - '${SANDBOX_TLS_DIR}/api:/tls:ro'
+    environment:
+      - SANDBOX_API_KEYS=${SANDBOX_API_KEY}
+      - SANDBOX_API_RUNNER_REGISTRATION_TOKEN=${SANDBOX_REGISTRATION_TOKEN}
+      - SANDBOX_API_RUNNER_API_KEY=${SANDBOX_RUNNER_API_KEY}
+      - SANDBOX_API_GRPC_TLS_CERT_FILE=/tls/grpc-server.crt
+      - SANDBOX_API_GRPC_TLS_KEY_FILE=/tls/grpc-server.key
+      - SANDBOX_API_GRPC_TLS_CLIENT_CA_FILE=/tls/ca.crt
+      - SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CA_FILE=/tls/ca.crt
+      - SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CERT_FILE=/tls/control-grpc-api-client.crt
+      - SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_KEY_FILE=/tls/control-grpc-api-client.key
+      - SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_SERVER_NAME=sandbox-runner-1
+      - SANDBOX_API_LOG_LEVEL=warn
+
+  sandbox-runner-1:
+    image: ${SANDBOX_RUNNER_IMAGE}
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - '${SANDBOX_TLS_DIR}/runner:/tls:ro'
+    environment:
+      - SANDBOX_RUNNER_API_KEYS=${SANDBOX_RUNNER_API_KEY}
+      - SANDBOX_RUNNER_REGISTRATION_TOKEN=${SANDBOX_REGISTRATION_TOKEN}
+      - SANDBOX_RUNNER_API_GRPC_ADDR=sandbox-api:9090
+      - SANDBOX_RUNNER_HTTP_BASE_URL=https://sandbox-runner-1:8080
+      - SANDBOX_RUNNER_CONTROL_GRPC_LISTEN_ADDR=:9091
+      - SANDBOX_RUNNER_CONTROL_GRPC_ADVERTISE_ADDR=sandbox-runner-1:9091
+      - SANDBOX_RUNNER_ID=ci-runner-1
+      - SANDBOX_RUNNER_DOCKER_SANDBOX_IMAGE=${SANDBOX_SANDBOX_IMAGE}
+      - SANDBOX_RUNNER_LOG_LEVEL=warn
+      - SANDBOX_RUNNER_REGISTRATION_GRPC_CA_FILE=/tls/ca.crt
+      - SANDBOX_RUNNER_REGISTRATION_GRPC_CERT_FILE=/tls/grpc-client.crt
+      - SANDBOX_RUNNER_REGISTRATION_GRPC_KEY_FILE=/tls/grpc-client.key
+      - SANDBOX_RUNNER_REGISTRATION_GRPC_SERVER_NAME=sandbox-api
+      - SANDBOX_RUNNER_CONTROL_GRPC_TLS_CERT_FILE=/tls/control-grpc-server.crt
+      - SANDBOX_RUNNER_CONTROL_GRPC_TLS_KEY_FILE=/tls/control-grpc-server.key
+      - SANDBOX_RUNNER_CONTROL_GRPC_TLS_CLIENT_CA_FILE=/tls/ca.crt
+    depends_on:
+      - sandbox-api

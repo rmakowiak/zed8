@@ -1,0 +1,94 @@
+services:
+  postgres:
+    image: postgres:18.4-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=n8n
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    # Not PGDATA: Postgres 18+ moved it under /var/lib/postgresql/<major>/ and
+    # refuses to start when /var/lib/postgresql/data is mounted.
+    tmpfs:
+      - /var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # DB viewer in the browser, already connected to this worktree's database.
+  # Reached through pgweb-theme below, so it publishes no port itself.
+  pgweb:
+    image: sosedoff/pgweb:latest
+    restart: unless-stopped
+    environment:
+      - PGWEB_DATABASE_URL=postgres://postgres:password@postgres:5432/n8n?sslmode=disable
+    # pgweb's connect dialog never prefills fields; a bookmark makes reconnecting one click.
+    configs:
+      - source: pgweb-bookmark
+        target: /home/pgweb/.pgweb/bookmarks/n8n.toml
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # pgweb embeds its CSS in the binary, so this proxy injects the dark theme.
+  pgweb-theme:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    configs:
+      - source: pgweb-theme-nginx
+        target: /etc/nginx/conf.d/default.conf
+      - source: pgweb-dark-css
+        target: /usr/share/nginx/pgweb-dark.css
+    ports:
+      - '${PGWEB_PORT}:8081'
+    depends_on:
+      - pgweb
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - '${MAILPIT_SMTP_PORT}:1025'
+      - '${MAILPIT_HTTP_PORT}:8025'
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    profiles: ['queue']
+    ports:
+      - '${REDIS_PORT}:6379'
+
+configs:
+  pgweb-bookmark:
+    content: |
+      host = "postgres"
+      port = 5432
+      user = "postgres"
+      password = "password"
+      database = "n8n"
+      sslmode = "disable"
+  pgweb-dark-css:
+    file: ./pgweb-dark.css
+  pgweb-theme-nginx:
+    content: |
+      server {
+        listen 8081;
+        location = /wt-dark.css {
+          alias /usr/share/nginx/pgweb-dark.css;
+          default_type text/css;
+          add_header Cache-Control no-cache;
+        }
+        location / {
+          proxy_pass http://pgweb:8081;
+          proxy_http_version 1.1;
+          proxy_set_header Host $$host;
+          # sub_filter only rewrites uncompressed bodies.
+          proxy_set_header Accept-Encoding "";
+          proxy_read_timeout 600s;
+          sub_filter '</head>' '<link rel="stylesheet" href="wt-dark.css"></head>';
+          sub_filter_once on;
+        }
+      }

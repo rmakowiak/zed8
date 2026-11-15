@@ -1,0 +1,170 @@
+/*
+ * Dark theme for pgweb, close to the Zed "One Dark" look. pgweb embeds its
+ * own CSS in the binary, so the nginx proxy in docker-compose.yml injects
+ * this file after app.css. Selectors follow pgweb 0.17 app.css.
+ */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+	--bg: #1e1e1e;
+	--bg-panel: #181818;
+	--bg-raised: #252526;
+	--bg-hover: #2a2d2e;
+	--bg-active: #37373d;
+	--border: #2b2b2b;
+	--border-strong: #3c3c3c;
+	--text: #cccccc;
+	--text-strong: #e6e6e6;
+	--text-muted: #8b8b8b;
+	--accent: #74ade8;
+	--accent-strong: #3b6ea8;
+	--green: #98c379;
+	--yellow: #e5c07b;
+	--red: #e06c75;
+	--purple: #c678dd;
+	--cyan: #56b6c2;
+	--orange: #d19a66;
+	--comment: #7f848e;
+	color-scheme: dark;
+}
+
+html, body { background: var(--bg) !important; color: var(--text); }
+
+/* Same fonts as Zed. Local installs win; Google Fonts is the fallback. */
+body, button, input, select, textarea, .btn, .form-control, .dropdown-menu, #nav, #sidebar, #pagination {
+	font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+}
+.ace_editor, .ace_editor *, #results td, #results td *, #results_view pre, #content_modal .content, code, pre {
+	font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace !important;
+}
+#results td { font-size: 12px; }
+a { color: var(--accent); }
+a:hover, a:focus { color: var(--text-strong); }
+
+/* Top tabs */
+#nav { background: var(--bg-panel); border-bottom: 1px solid var(--border); }
+#nav ul li { color: var(--text-muted); }
+#nav ul li:hover { color: var(--text-strong); }
+#nav ul li.selected, #nav ul li.selected:before { background: var(--bg); color: var(--text-strong); }
+#edit_connection, #close_connection { background: var(--bg-raised); color: var(--text); border-color: var(--border-strong); }
+
+/* Sidebar */
+#sidebar { background: var(--bg-panel); border-right: 1px solid var(--border); }
+#sidebar .current-database,
+#sidebar .current-database input.typeahead { background: var(--bg-raised); color: var(--text-strong); }
+#sidebar .current-database span.refresh,
+#sidebar .current-database input.typeahead::-webkit-input-placeholder { color: var(--text-muted); }
+#sidebar .objects-search .wrap { border-bottom-color: var(--border); }
+#sidebar .objects-search input[type="text"] { color: var(--text); }
+#sidebar .objects-search i.fa-search,
+#sidebar .objects-search i.fa-times-circle { color: var(--text-muted); }
+#sidebar .objects-search i.fa-times-circle:hover { color: var(--text); }
+#sidebar div.table-information .title { color: var(--text-muted); border-top-color: var(--border); }
+#sidebar div.table-information .lines .line { color: var(--text-muted) !important; }
+#sidebar div.table-information .lines .line span { color: var(--text); }
+.schema .schema-container .schema-group,
+.schema .schema-container .schema-group ul li { color: var(--text); }
+.schema .schema-container .schema-group-count,
+.schema .schema-container .schema-group ul li i { color: var(--text-muted); }
+.schema .schema-container .schema-group ul li:hover { background: var(--bg-hover); }
+.schema .schema-container .schema-group ul li.active { background: var(--bg-active); color: var(--text-strong); }
+
+/* Query editor and its action bar */
+#input, #input .actions { background: var(--bg); }
+#input_resize_handler { background: var(--border); }
+#input .actions #result-rows-count,
+#input .actions #query_progress { color: var(--text-muted); }
+#input .actions .btn { color: var(--text); border-color: var(--border-strong); }
+#input .actions .btn:hover { color: var(--text-strong); border-color: var(--text-muted); }
+#input .actions .btn-primary { color: var(--green); border-color: var(--green); }
+#input .actions .btn-primary:hover { color: var(--bg) !important; background: var(--green) !important; border-color: var(--green); }
+
+/* Pagination and filters */
+#pagination { background: var(--bg-panel); border-bottom-color: var(--border); box-shadow: none; }
+#pagination .filters span, #pagination .current-page { color: var(--text-muted); }
+#pagination .filters .btn-primary { background: transparent; color: var(--green); border-color: var(--green); }
+
+/* Results grid */
+#body, #output, #results_view { background: var(--bg); }
+#results th { background: var(--bg-panel); color: var(--text-strong); border-bottom-color: var(--border-strong); }
+#results th:hover, #results[data-mode="browse"] th:hover { background: var(--bg-hover); }
+#results th.active { background: var(--bg-active); }
+#results tr:nth-child(even) > td { background: var(--bg); }
+#results tr:nth-child(odd) > td { background: #222222; }
+#results tbody tr { border-bottom-color: var(--border); }
+#results tbody tr:hover td { background: var(--bg-hover); }
+#results tr.selected td { background: var(--accent-strong) !important; color: var(--text-strong) !important; }
+#results td { color: var(--text); }
+#results td div span.null { color: var(--comment); font-style: italic; }
+#results td textarea { background: var(--bg-raised); color: var(--text) !important; }
+#results_view pre { background: var(--bg-raised); color: var(--text); }
+#results_view .copy { background: var(--bg-raised); border-color: var(--border-strong); color: var(--text); }
+#results_view .copy:hover { border-color: var(--text-muted); }
+
+/* Row content modal and error banner */
+#content_modal { background: var(--bg-raised); border-color: var(--border-strong); box-shadow: #000 0 0 20px; }
+#content_modal .content { background: var(--bg-raised); color: var(--text); }
+#content_modal .title { background: var(--bg-panel); color: var(--text-strong); }
+#content_modal .actions .fa { background: var(--bg-raised); border-color: var(--border-strong); color: var(--text); }
+#content_modal .actions .fa:hover { border-color: var(--text-muted); box-shadow: none; }
+#error_banner { background-color: #5a1d1d; color: #f4c7c7; }
+
+/* Connection window */
+#connection_window { background: var(--bg); }
+.connection-settings .header h1 { color: var(--text-muted); text-shadow: none; }
+.connection-settings .header .version, .connection-ssh-group h3 { color: var(--text-muted); }
+.connection-settings form { background: var(--bg-panel); border: 1px solid var(--border); }
+.connection-settings label { color: var(--text); }
+
+/* Bootstrap pieces */
+.form-control, input, select, textarea {
+	background-color: var(--bg-raised) !important;
+	color: var(--text) !important;
+	border-color: var(--border-strong) !important;
+}
+.form-control:focus { border-color: var(--accent) !important; box-shadow: none !important; }
+::placeholder { color: var(--text-muted) !important; }
+.btn-default { background: var(--bg-raised); color: var(--text); border-color: var(--border-strong); }
+.btn-default:hover, .btn-default:focus, .btn-default.active, .open > .dropdown-toggle.btn-default {
+	background: var(--bg-hover); color: var(--text-strong); border-color: var(--text-muted);
+}
+.btn-primary { background: var(--accent-strong); border-color: var(--accent-strong); color: var(--text-strong); }
+.btn-primary:hover { background: var(--accent); border-color: var(--accent); }
+.dropdown-menu, .typeahead.dropdown-menu, .context-menu .dropdown-menu {
+	background: var(--bg-raised); border-color: var(--border-strong); box-shadow: 0 6px 12px #000;
+}
+.dropdown-menu > li > a { color: var(--text); }
+.dropdown-menu > li > a:hover, .dropdown-menu > li > a:focus,
+.dropdown-menu > .active > a, .dropdown-menu > .active > a:hover {
+	background: var(--bg-active); color: var(--text-strong);
+}
+.dropdown-menu .divider { background: var(--border-strong); }
+.table > thead > tr > th, .table > tbody > tr > td { border-color: var(--border); }
+.modal-content { background: var(--bg-raised); color: var(--text); border-color: var(--border-strong); }
+.modal-header, .modal-footer { border-color: var(--border); }
+.close { color: var(--text); text-shadow: none; }
+.alert-danger { background: #5a1d1d; border-color: #7a2a2a; color: #f4c7c7; }
+.alert-info { background: #1d3a5a; border-color: #2a527a; color: #c7ddf4; }
+.alert-warning { background: #4a3d1a; border-color: #6a5826; color: #f4e3c7; }
+::-webkit-scrollbar { width: 10px; height: 10px; background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; }
+
+/* Ace editor: pgweb uses ace/theme/tomorrow, so recolor its tokens */
+.ace_editor, .ace-tomorrow { background: var(--bg) !important; color: var(--text) !important; }
+.ace_gutter, .ace_gutter-cell { background: var(--bg) !important; color: #5a5a5a !important; }
+.ace-tomorrow .ace_gutter-active-line { background: var(--bg-hover) !important; color: var(--text) !important; }
+.ace-tomorrow .ace_cursor { color: var(--accent) !important; }
+.ace-tomorrow .ace_marker-layer .ace_selection { background: #264f78 !important; }
+.ace-tomorrow .ace_marker-layer .ace_selected-word { border-color: var(--border-strong) !important; }
+.ace-tomorrow .ace_marker-layer .ace_bracket { border-color: var(--text-muted) !important; }
+.ace-tomorrow .ace_keyword, .ace-tomorrow .ace_meta, .ace-tomorrow .ace_storage { color: var(--purple) !important; }
+.ace-tomorrow .ace_string { color: var(--green) !important; }
+.ace-tomorrow .ace_constant.ace_numeric, .ace-tomorrow .ace_constant.ace_language { color: var(--orange) !important; }
+.ace-tomorrow .ace_support.ace_function { color: var(--accent) !important; }
+.ace-tomorrow .ace_support.ace_type, .ace-tomorrow .ace_storage.ace_type { color: var(--yellow) !important; }
+.ace-tomorrow .ace_variable, .ace-tomorrow .ace_identifier { color: var(--text) !important; }
+.ace-tomorrow .ace_keyword.ace_operator { color: var(--cyan) !important; }
+.ace-tomorrow .ace_comment { color: var(--comment) !important; font-style: italic; }
+.ace_autocomplete { background: var(--bg-raised) !important; color: var(--text) !important; border-color: var(--border-strong) !important; }
+.ace_autocomplete .ace_active-line, .ace_autocomplete .ace_line-hover { background: var(--bg-active) !important; }
+.ace_autocomplete .ace_completion-highlight { color: var(--accent) !important; }

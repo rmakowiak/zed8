@@ -1,0 +1,33 @@
+{
+  "terminal": {
+    "env": {
+      "N8N_SMTP_PORT": "21025",
+      "DB_POSTGRESDB_HOST": "localhost",
+      "DB_TYPE": "postgresdb",
+      "N8N_INSTANCE_AI_RUN_DEBUG_ENABLED": "true",
+      "N8N_WT_LABEL": "beta",
+      "N8N_PORT": "25678",
+      "NODEJS_PREFER_IPV4": "true",
+      "N8N_INSTANCE_OWNER_EMAIL": "n8n.local@rmakowiak.com",
+      "N8N_INSTANCE_OWNER_LAST_NAME": "Local",
+      "DB_POSTGRESDB_DATABASE": "n8n",
+      "N8N_USER_FOLDER": "/wt/n8n/beta/n8n-home",
+      "DB_POSTGRESDB_USER": "postgres",
+      "N8N_LICENSE_ACTIVATION_KEY": "",
+      "DB_POSTGRESDB_PORT": "25432",
+      "N8N_INSTANCE_AI_MODEL": "anthropic/claude-opus-4-8",
+      "N8N_FEATURE_FLAG_OVERRIDES": "{\"111_context_preferences\":\"variant\"}",
+      "N8N_INSTANCE_OWNER_PASSWORD_HASH": "",
+      "N8N_EDITOR_PORT": "28080",
+      "TURBO_CACHE_DIR": "/wt/shared/turbo-cache",
+      "N8N_INSTANCE_OWNER_MANAGED_BY_ENV": "true",
+      "N8N_LICENSE_TENANT_ID": "1001",
+      "N8N_INSTANCE_OWNER_FIRST_NAME": "Dev",
+      "N8N_RUNNERS_BROKER_PORT": "29679",
+      "N8N_ENABLED_MODULES": "agents",
+      "N8N_SMTP_HOST": "localhost",
+      "INSTANCE_AI_BRAVE_SEARCH_API_KEY": "",
+      "DB_POSTGRESDB_PASSWORD": "password"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "alpha",
+  "slot": 3,
+  "branch": "alpha",
+  "base": "master",
+  "queue": false,
+  "sandbox": true,
+  "telemetry": true,
+  "source_repo": "/src/n8n",
+  "created_at": "2026-01-01T00:00:00Z",
+  "ports": {
+    "postgres": 25435,
+    "redis": 26382,
+    "mailpit_smtp": 21028,
+    "mailpit_http": 28028,
+    "pgweb": 27435,
+    "n8n": 25681,
+    "editor": 28083,
+    "broker": 29682,
+    "sandbox": 19080,
+    "telemetry": 19081
+  }
+}

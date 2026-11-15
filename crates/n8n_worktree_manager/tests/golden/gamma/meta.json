@@ -1,0 +1,23 @@
+{
+  "name": "gamma",
+  "slot": 7,
+  "branch": "feature/gamma-existing",
+  "base": "",
+  "queue": true,
+  "sandbox": true,
+  "telemetry": false,
+  "source_repo": "/src/n8n",
+  "created_at": "2026-01-01T00:00:00Z",
+  "ports": {
+    "postgres": 25439,
+    "redis": 26386,
+    "mailpit_smtp": 21032,
+    "mailpit_http": 28032,
+    "pgweb": 27439,
+    "n8n": 25685,
+    "editor": 28087,
+    "broker": 29686,
+    "sandbox": 19080,
+    "telemetry": 19081
+  }
+}

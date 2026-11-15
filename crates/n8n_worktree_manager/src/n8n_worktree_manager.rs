@@ -1,0 +1,406 @@
+pub mod linear;
+pub mod model;
+mod provision;
+pub mod render;
+pub mod services;
+pub mod settings;
+pub mod store;
+pub mod system;
+
+use anyhow::{Context as _, Result, bail};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use model::{Meta, Setup};
+use settings::Settings;
+use store::{Store, read_meta};
+use system::{Command, System};
+
+/// The name of the folder of the checkout inside a worktree folder.
+pub const CHECKOUT: &str = "n8n";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateOptions {
+    pub name: String,
+    /// An existing branch to check out, or a new branch to make from `base`.
+    /// Without it, the branch is the worktree name.
+    pub branch: Option<String>,
+    pub base: String,
+    pub issue: Option<String>,
+    pub queue: bool,
+    pub sandbox: bool,
+    pub telemetry: bool,
+    pub build: bool,
+    pub source_repo: Option<PathBuf>,
+}
+
+impl CreateOptions {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            branch: None,
+            base: "master".to_string(),
+            issue: None,
+            queue: false,
+            sandbox: true,
+            telemetry: true,
+            build: true,
+            source_repo: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SetOptions {
+    /// `Some(None)` removes the issue.
+    pub issue: Option<Option<String>>,
+    pub queue: Option<bool>,
+    /// Shared services to switch on or off, by name: `sandbox`, `telemetry`.
+    pub services: Vec<(String, bool)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TeardownOptions {
+    /// Tear down even with uncommitted changes in the checkout.
+    pub force: bool,
+    /// Also delete the local branch in the source repo.
+    pub delete_branch: bool,
+}
+
+pub struct Manager {
+    settings: Settings,
+    store: Store,
+    system: Arc<dyn System>,
+}
+
+impl Manager {
+    pub fn new(settings: Settings, system: Arc<dyn System>) -> Self {
+        let store = Store::new(settings.wt_home.clone());
+        Self {
+            settings,
+            store,
+            system,
+        }
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    pub fn list(&self) -> Result<Vec<Meta>> {
+        self.store.list()
+    }
+
+    pub fn show(&self, name: &str) -> Result<Meta> {
+        let path = self.store.meta_path(&slugify(name));
+        if !path.is_file() {
+            bail!("No worktree named '{name}'. See: n8n-worktree-manager list");
+        }
+        read_meta(&path)
+    }
+
+    pub fn worktree_dir(&self, name: &str) -> PathBuf {
+        self.settings.worktree_dir(name)
+    }
+
+    pub fn checkout_dir(&self, name: &str) -> PathBuf {
+        self.worktree_dir(name).join(CHECKOUT)
+    }
+
+    /// Claims a slot, adds the git worktree and writes `meta.json` with the
+    /// setup pending. Fast: the slow part is `provision`.
+    pub fn create(&self, options: CreateOptions) -> Result<Meta> {
+        let name = slugify(&options.name);
+        if name.is_empty() {
+            bail!("The name '{}' is empty after slugify", options.name);
+        }
+        if self.store.meta_path(&name).is_file() {
+            return self.show(&name);
+        }
+        if self.worktree_dir(&name).exists() {
+            bail!(
+                "{} exists but has no meta.json. Move it away or pick another name.",
+                self.worktree_dir(&name).display()
+            );
+        }
+        let source_repo = options
+            .source_repo
+            .clone()
+            .unwrap_or_else(|| self.settings.default_source_repo.clone());
+        if !is_n8n_repo(&source_repo) {
+            bail!(
+                "No n8n checkout at {}. Set N8N_WT_SOURCE_REPO in secrets.env.",
+                source_repo.display()
+            );
+        }
+        let checkout = self.checkout_dir(&name);
+        let branch = options.branch.clone().unwrap_or_else(|| name.clone());
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(source_repo.to_string_lossy())
+                .args(args.iter().copied())
+        };
+
+        let meta = self.store.claim(|slot| {
+            let mut meta = Meta::new(
+                &name,
+                slot,
+                &branch,
+                &options.base,
+                &source_repo.to_string_lossy(),
+            );
+            meta.queue = options.queue;
+            meta.sandbox = options.sandbox;
+            meta.telemetry = options.telemetry;
+            meta.issue = options.issue.clone();
+            meta.setup = Some(Setup::pending(options.build));
+            meta
+        })?;
+
+        let checkout_text = checkout.to_string_lossy().into_owned();
+        let added = (|| -> Result<()> {
+            if options.branch.is_some() {
+                // A missing remote branch is normal for a new Linear branch.
+                self.system
+                    .run(&git(&["fetch", "origin", &branch, "--quiet"]))?;
+                let local_ref = format!("refs/heads/{branch}");
+                if self
+                    .system
+                    .run(&git(&["show-ref", "--verify", "--quiet", &local_ref]))?
+                    .success
+                {
+                    self.run(&git(&[
+                        "worktree",
+                        "add",
+                        &checkout_text,
+                        &branch,
+                        "--quiet",
+                    ]))?;
+                    return Ok(());
+                }
+                let remote_ref = format!("refs/remotes/origin/{branch}");
+                if self
+                    .system
+                    .run(&git(&["show-ref", "--verify", "--quiet", &remote_ref]))?
+                    .success
+                {
+                    let remote = format!("origin/{branch}");
+                    self.run(&git(&[
+                        "worktree",
+                        "add",
+                        &checkout_text,
+                        "-b",
+                        &branch,
+                        &remote,
+                        "--quiet",
+                    ]))?;
+                    return Ok(());
+                }
+            }
+            self.run(&git(&["fetch", "origin", &options.base, "--quiet"]))?;
+            let new_from = format!("origin/{}", options.base);
+            self.run(&git(&[
+                "worktree",
+                "add",
+                &checkout_text,
+                "-b",
+                &branch,
+                &new_from,
+                "--quiet",
+            ]))?;
+            Ok(())
+        })();
+        if let Err(error) = added {
+            // Nothing else exists yet, so the claim goes away with the folder.
+            std::fs::remove_dir_all(self.worktree_dir(&name)).ok();
+            return Err(error);
+        }
+        Ok(meta)
+    }
+
+    /// The Linear client with the key from `secrets.env`.
+    pub fn linear(&self) -> linear::Linear {
+        linear::Linear::new(Box::new(linear::CurlTransport {
+            api_key: self.settings.linear_api_key.clone(),
+        }))
+    }
+
+    /// My open issues joined with the worktrees. Also refreshes the cache
+    /// that `context` reads.
+    pub fn issues(&self, linear: &linear::Linear) -> Result<Vec<linear::IssueRow>> {
+        let issues = linear.my_issues()?;
+        let cache = linear::cache_path(&self.settings.wt_home);
+        store::write_atomic(&cache, &(serde_json::to_string_pretty(&issues)? + "\n"))?;
+        Ok(linear::join(issues, &self.list()?))
+    }
+
+    /// Moves the issue to In Progress, then creates its worktree on the
+    /// Linear branch name, with the issue key in `meta.json`. Provision is
+    /// the next step.
+    pub fn start(&self, linear: &linear::Linear, key: &str) -> Result<Meta> {
+        let started = linear.start_issue(key)?;
+        let mut options = CreateOptions::new(&started.identifier.to_lowercase());
+        if !started.branch_name.is_empty() {
+            options.branch = Some(started.branch_name.clone());
+        }
+        options.issue = Some(started.identifier.clone());
+        let meta = self.create(options)?;
+        if meta.issue.as_deref() != Some(started.identifier.as_str()) {
+            return self.set(
+                &meta.name,
+                SetOptions {
+                    issue: Some(Some(started.identifier)),
+                    ..SetOptions::default()
+                },
+            );
+        }
+        Ok(meta)
+    }
+
+    /// The context text for the worktree that contains `dir`, or an empty
+    /// text when `dir` is not in a worktree. The SessionStart hook prints it.
+    pub fn context(&self, dir: &Path) -> Result<String> {
+        let Some(meta) = self.find_by_dir(dir)? else {
+            return Ok(String::new());
+        };
+        let cache = linear::read_cache(&self.settings.wt_home);
+        let key = meta
+            .issue
+            .clone()
+            .or_else(|| linear::issue_key_from_branch(&meta.branch));
+        let issue = key.and_then(|key| cache.into_iter().find(|issue| issue.identifier == key));
+        Ok(render::context(&self.settings, &meta, issue.as_ref()))
+    }
+
+    /// The worktree whose folder contains `dir`.
+    pub fn find_by_dir(&self, dir: &Path) -> Result<Option<Meta>> {
+        let envs = self.store.envs_dir();
+        let Ok(envs) = envs.canonicalize() else {
+            return Ok(None);
+        };
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        for ancestor in dir.ancestors() {
+            if ancestor.parent() == Some(envs.as_path()) && ancestor.join("meta.json").is_file() {
+                return read_meta(&ancestor.join("meta.json")).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Changes a worktree and rewrites its generated files. A running dev:be
+    /// must restart to see a new env.sh.
+    pub fn set(&self, name: &str, options: SetOptions) -> Result<Meta> {
+        let mut meta = self.show(name)?;
+        if let Some(issue) = options.issue {
+            meta.issue = issue.map(|key| key.trim().to_uppercase());
+        }
+        let queue_changed = options.queue.is_some_and(|queue| queue != meta.queue);
+        if let Some(queue) = options.queue {
+            meta.queue = queue;
+        }
+        for (service, enabled) in &options.services {
+            match service.as_str() {
+                "sandbox" => meta.sandbox = *enabled,
+                "telemetry" => meta.telemetry = *enabled,
+                other => bail!("Unknown service '{other}'. Known: sandbox, telemetry."),
+            }
+        }
+        self.store.write(&meta)?;
+        if self.worktree_dir(&meta.name).join("env.sh").is_file() {
+            self.write_files(&meta)?;
+            if queue_changed && meta.queue {
+                self.compose_up(&meta)?;
+            }
+        }
+        Ok(meta)
+    }
+
+    /// Rewrites the generated files of a worktree: env.sh, the compose files,
+    /// the Zed files and the badge.
+    pub fn sync(&self, name: &str) -> Result<Meta> {
+        let meta = self.show(name)?;
+        self.write_files(&meta)?;
+        Ok(meta)
+    }
+
+    /// Stops the containers and deletes their database, removes the git
+    /// worktree and deletes the folder. The slot is free once the folder is
+    /// gone.
+    pub fn teardown(&self, name: &str, options: TeardownOptions) -> Result<()> {
+        let meta = self.show(name)?;
+        let dir = self.worktree_dir(&meta.name);
+        let checkout = dir.join(CHECKOUT);
+        let git_in = |repo: &Path, args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.to_string_lossy())
+                .args(args.iter().copied())
+        };
+        if checkout.is_dir() && !options.force {
+            let status = self
+                .system
+                .run(&git_in(&checkout, &["status", "--porcelain"]))?;
+            if !status.stdout.trim().is_empty() {
+                bail!(
+                    "'{}' has uncommitted changes in {}. Commit them, or tear down with --force to lose them.",
+                    meta.name,
+                    checkout.display()
+                );
+            }
+        }
+        // By project name, so it also works when docker-compose.yml is gone.
+        let down = Command::new("docker").args([
+            "compose",
+            "-p",
+            &render::compose_project(&meta.name),
+            "down",
+            "-v",
+            "--remove-orphans",
+        ]);
+        if let Err(error) = self.run(&down) {
+            eprintln!("warning: {error:#}");
+        }
+        let source_repo = PathBuf::from(&meta.source_repo);
+        if checkout.is_dir() && !meta.source_repo.is_empty() {
+            let checkout_text = checkout.to_string_lossy().into_owned();
+            if let Err(error) = self.run(&git_in(
+                &source_repo,
+                &["worktree", "remove", &checkout_text, "--force"],
+            )) {
+                eprintln!("warning: {error:#}");
+            }
+        }
+        if options.delete_branch && !meta.source_repo.is_empty() {
+            if let Err(error) = self.run(&git_in(&source_repo, &["branch", "-D", &meta.branch])) {
+                eprintln!("warning: {error:#}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).with_context(|| format!("deleting {}", dir.display()))
+    }
+
+    /// Runs a command and fails with its stderr when it fails.
+    fn run(&self, command: &Command) -> Result<String> {
+        let output = self.system.run(command)?;
+        if !output.success {
+            bail!("{} failed: {}", command.line(), output.stderr.trim());
+        }
+        Ok(output.stdout)
+    }
+}
+
+pub fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    for character in name.to_lowercase().chars() {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            slug.push(character);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+pub fn is_n8n_repo(path: &Path) -> bool {
+    path.join("pnpm-workspace.yaml").is_file() && path.join("packages/cli").is_dir()
+}

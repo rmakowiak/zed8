@@ -1,0 +1,23 @@
+{
+  "name": "beta",
+  "slot": 0,
+  "branch": "beta",
+  "base": "master",
+  "queue": false,
+  "sandbox": false,
+  "telemetry": false,
+  "source_repo": "/src/n8n",
+  "created_at": "2026-01-01T00:00:00Z",
+  "ports": {
+    "postgres": 25432,
+    "redis": 26379,
+    "mailpit_smtp": 21025,
+    "mailpit_http": 28025,
+    "pgweb": 27432,
+    "n8n": 25678,
+    "editor": 28080,
+    "broker": 29679,
+    "sandbox": 19080,
+    "telemetry": 19081
+  }
+}

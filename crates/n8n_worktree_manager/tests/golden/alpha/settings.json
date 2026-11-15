@@ -1,0 +1,43 @@
+{
+  "terminal": {
+    "env": {
+      "N8N_SMTP_PORT": "21028",
+      "DB_POSTGRESDB_HOST": "localhost",
+      "DB_TYPE": "postgresdb",
+      "N8N_INSTANCE_AI_RUN_DEBUG_ENABLED": "true",
+      "N8N_WT_LABEL": "alpha",
+      "N8N_PORT": "25681",
+      "N8N_DIAGNOSTICS_CONFIG_BACKEND": "stub;http://localhost:19081",
+      "N8N_INSTANCE_AI_MODEL_API_KEY": "sk-ant-fake",
+      "NODEJS_PREFER_IPV4": "true",
+      "N8N_INSTANCE_OWNER_EMAIL": "n8n.local@rmakowiak.com",
+      "N8N_INSTANCE_AI_SANDBOX_ENABLED": "true",
+      "N8N_INSTANCE_OWNER_LAST_NAME": "Local",
+      "DB_POSTGRESDB_DATABASE": "n8n",
+      "N8N_DIAGNOSTICS_CONFIG_FRONTEND": "stub;http://localhost:19081",
+      "N8N_DIAGNOSTICS_POSTHOG_API_KEY": "stub",
+      "N8N_USER_FOLDER": "/wt/n8n/alpha/n8n-home",
+      "N8N_DIAGNOSTICS_POSTHOG_API_HOST": "http://localhost:19081",
+      "N8N_SANDBOX_SERVICE_URL": "http://localhost:19080",
+      "N8N_DIAGNOSTICS_ENABLED": "true",
+      "DB_POSTGRESDB_USER": "postgres",
+      "N8N_LICENSE_ACTIVATION_KEY": "fake-license-key",
+      "DB_POSTGRESDB_PORT": "25435",
+      "N8N_INSTANCE_AI_MODEL": "anthropic/claude-opus-4-8",
+      "N8N_FEATURE_FLAG_OVERRIDES": "{\"111_context_preferences\":\"variant\"}",
+      "N8N_INSTANCE_OWNER_PASSWORD_HASH": "$2a$10$fakefakefakefakefakefakefakefakefakefakefakefakefake",
+      "N8N_EDITOR_PORT": "28083",
+      "TURBO_CACHE_DIR": "/wt/shared/turbo-cache",
+      "N8N_INSTANCE_OWNER_MANAGED_BY_ENV": "true",
+      "N8N_SANDBOX_SERVICE_API_KEY": "n8n-sandbox-ci-key",
+      "N8N_LICENSE_TENANT_ID": "1001",
+      "N8N_INSTANCE_OWNER_FIRST_NAME": "Dev",
+      "N8N_RUNNERS_BROKER_PORT": "29682",
+      "N8N_INSTANCE_AI_SANDBOX_PROVIDER": "n8n-sandbox",
+      "N8N_ENABLED_MODULES": "agents",
+      "N8N_SMTP_HOST": "localhost",
+      "INSTANCE_AI_BRAVE_SEARCH_API_KEY": "fake-brave-key",
+      "DB_POSTGRESDB_PASSWORD": "password"
+    }
+  }
+}

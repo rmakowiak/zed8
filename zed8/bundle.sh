@@ -24,6 +24,7 @@ export CARGO_TARGET_DIR="$PWD/target/zed8"
 
 # Without full Xcode, Metal shaders compile at run time.
 cargo build --profile release-fast -p zed -p cli --features gpui_platform/runtime_shaders
+cargo build --profile release-fast -p n8n_worktree_manager
 
 bin="$CARGO_TARGET_DIR/release-fast"
 app="$CARGO_TARGET_DIR/Zed8.app"
@@ -34,6 +35,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/zed" "$app/Contents/MacOS/zed"
 cp "$bin/cli" "$app/Contents/MacOS/cli"
+cp "$bin/n8n-worktree-manager" "$app/Contents/MacOS/n8n-worktree-manager"
 # Official Zed ships its own git. Zed falls back to the system git without it.
 [ -x /Applications/Zed.app/Contents/MacOS/git ] && cp /Applications/Zed.app/Contents/MacOS/git "$app/Contents/MacOS/git"
 cp crates/zed/resources/Document.icns "$app/Contents/Resources/Document.icns"
