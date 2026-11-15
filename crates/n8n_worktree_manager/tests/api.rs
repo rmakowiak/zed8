@@ -49,7 +49,10 @@ fn create_adds_a_git_worktree_on_a_new_branch_and_writes_a_pending_meta() {
     assert_eq!(
         setup.system.commands(),
         [
-            format!("git -C {source} fetch origin master --quiet"),
+            format!("git -C {source} remote get-url origin"),
+            format!(
+                "git -C {source} fetch --quiet origin +refs/heads/master:refs/remotes/origin/master"
+            ),
             format!(
                 "git -C {source} worktree add {} -b feature-one origin/master --quiet",
                 checkout.display()
@@ -476,5 +479,114 @@ fn services_up_telemetry_starts_the_capture_and_saves_its_pid() {
     assert_eq!(
         fs::read_to_string(telemetry.join("telemetry.pid")).expect("pid file"),
         "4242\n"
+    );
+}
+
+#[test]
+fn set_flag_is_kept_in_meta_and_survives_sync() {
+    let setup = setup();
+    setup
+        .manager
+        .create(CreateOptions::new("feature-one"))
+        .expect("create");
+    setup.manager.provision("feature-one").expect("provision");
+    let env_sh = setup.wt_home.join("n8n/feature-one/env.sh");
+
+    let options = SetOptions {
+        flags: vec![("136_skill_sync".to_string(), Some(serde_json::json!(true)))],
+        ..SetOptions::default()
+    };
+    setup.manager.set("feature-one", options).expect("set");
+    setup.manager.sync("feature-one").expect("sync");
+
+    let on_disk = setup.manager.show("feature-one").expect("show");
+    assert_eq!(
+        on_disk.flags.get("136_skill_sync"),
+        Some(&serde_json::json!(true))
+    );
+    assert!(
+        fs::read_to_string(&env_sh)
+            .expect("env.sh")
+            .contains("\"136_skill_sync\":true")
+    );
+
+    let options = SetOptions {
+        flags: vec![("136_skill_sync".to_string(), None)],
+        ..SetOptions::default()
+    };
+    let meta = setup.manager.set("feature-one", options).expect("set");
+    assert!(meta.flags.is_empty());
+    assert!(
+        !fs::read_to_string(&env_sh)
+            .expect("env.sh")
+            .contains("136_skill_sync")
+    );
+}
+
+#[test]
+fn create_with_a_branch_returns_the_worktree_that_has_it_checked_out() {
+    let setup = setup();
+    setup
+        .manager
+        .create(CreateOptions::new("feature-one"))
+        .expect("create");
+    let checkout = setup.wt_home.join("n8n/feature-one/n8n");
+    // The branch was switched after create, so meta.json still says feature-one.
+    setup.system.respond(
+        &format!("git -C {} branch --show-current", checkout.display()),
+        Output::ok("context-424-skills\n"),
+    );
+    setup.system.clear_commands();
+
+    let mut options = CreateOptions::new("context-424");
+    options.branch = Some("context-424-skills".to_string());
+    let meta = setup.manager.create(options).expect("create");
+
+    assert_eq!(meta.name, "feature-one");
+    assert!(
+        !setup
+            .system
+            .commands()
+            .iter()
+            .any(|line| line.contains("worktree add") || line.contains("fetch"))
+    );
+    assert!(!setup.wt_home.join("n8n/context-424").exists());
+}
+
+#[test]
+fn create_fetches_over_https_because_a_raycast_shell_has_no_ssh_key() {
+    let setup = setup();
+    let source = setup.source.display().to_string();
+    setup.system.respond(
+        &format!("git -C {source} remote get-url origin"),
+        Output::ok("git@github.com:n8n-io/n8n.git\n"),
+    );
+    setup.system.fail(&format!(
+        "git -C {source} show-ref --verify --quiet refs/heads/new-branch"
+    ));
+    setup.system.fail(&format!(
+        "git -C {source} show-ref --verify --quiet refs/remotes/origin/new-branch"
+    ));
+
+    let mut options = CreateOptions::new("new-branch");
+    options.branch = Some("new-branch".to_string());
+    setup.manager.create(options).expect("create");
+
+    let fetches: Vec<String> = setup
+        .system
+        .commands()
+        .into_iter()
+        .filter(|line| line.contains(" fetch "))
+        .collect();
+    assert_eq!(
+        fetches,
+        [
+            format!(
+                "git -C {source} fetch --quiet https://github.com/n8n-io/n8n.git +refs/heads/new-branch:refs/remotes/origin/new-branch"
+            ),
+            format!(
+                "git -C {source} fetch --quiet https://github.com/n8n-io/n8n.git +refs/heads/master:refs/remotes/origin/master"
+            ),
+        ]
     );
 }

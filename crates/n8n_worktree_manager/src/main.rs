@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use n8n_worktree_manager::render::{self, SCHEMA_VERSION};
 use n8n_worktree_manager::services::SERVICES;
 use n8n_worktree_manager::settings::Settings;
-use n8n_worktree_manager::system::RealSystem;
+use n8n_worktree_manager::system::{Command, RealSystem, System as _};
 use n8n_worktree_manager::{CreateOptions, Manager, SetOptions, TeardownOptions};
 use serde_json::json;
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
@@ -18,11 +18,16 @@ use std::sync::Arc;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    /// Show a macOS notification when the command ends, for runs without a
+    /// terminal, for example from Raycast.
+    #[arg(long, global = true)]
+    notify: bool,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// List the worktrees.
+    #[command(alias = "ls")]
     List(JsonFlag),
     /// Show one worktree.
     Show {
@@ -45,9 +50,10 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
-    /// Open the worktree in the current Zed window.
+    /// Focus the Zed window of the worktree, or open a new window.
     Open { name: String },
     /// Stop the containers, delete the database, remove the git worktree and the folder.
+    #[command(aliases = ["rm", "down"])]
     Teardown {
         name: String,
         /// Tear down even with uncommitted changes.
@@ -117,7 +123,7 @@ struct CreateArgs {
     #[arg(long)]
     no_telemetry: bool,
     /// Skip pnpm build in the setup.
-    #[arg(long)]
+    #[arg(long, alias = "skip-build")]
     no_build: bool,
     /// Only create. Run `provision` later.
     #[arg(long)]
@@ -125,6 +131,9 @@ struct CreateArgs {
     /// Open the worktree in Zed after create.
     #[arg(long)]
     open: bool,
+    /// The old `n8n-wt create --no-open`. Not opening is the default now.
+    #[arg(long, hide = true, conflicts_with = "open")]
+    no_open: bool,
     #[command(flatten)]
     json: JsonFlag,
 }
@@ -142,6 +151,13 @@ struct SetArgs {
     /// <service>=on|off, for example sandbox=off. Can repeat.
     #[arg(long)]
     service: Vec<String>,
+    /// <flag>=<value> for this worktree only, for example 136_skill_sync=true.
+    /// The value is JSON when it parses (true, 3), otherwise a string. Can repeat.
+    #[arg(long)]
+    flag: Vec<String>,
+    /// Removes a worktree flag set with --flag. Can repeat.
+    #[arg(long)]
+    no_flag: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -177,12 +193,34 @@ enum LinearQuery {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let manager = Manager::new(Settings::load(), Arc::new(RealSystem));
-    match run(&manager, cli.command) {
+    let command_line = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let result = run(&manager, cli.command);
+    if cli.notify {
+        let text = match &result {
+            Ok(()) => format!("Done: {command_line}"),
+            Err(error) => format!("Failed: {error}"),
+        };
+        notify(&text);
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn notify(text: &str) {
+    let escape = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        "display notification \"{}\" with title \"n8n-worktree-manager\"",
+        escape(text)
+    );
+    match RealSystem.run(&Command::new("osascript").args(["-e", &script])) {
+        Ok(output) if output.success => {}
+        Ok(output) => eprintln!("warning: no notification: {}", output.stderr.trim()),
+        Err(error) => eprintln!("warning: no notification: {error:#}"),
     }
 }
 
@@ -328,6 +366,17 @@ fn run(manager: &Manager, command: Commands) -> Result<()> {
                     .split_once('=')
                     .context("--service needs <service>=on|off")?;
                 options.services.push((name.to_string(), on_off(value)?));
+            }
+            for flag in args.flag {
+                let (key, value) = flag
+                    .split_once('=')
+                    .context("--flag needs <flag>=<value>")?;
+                let value = serde_json::from_str(value)
+                    .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+                options.flags.push((key.to_string(), Some(value)));
+            }
+            for key in args.no_flag {
+                options.flags.push((key, None));
             }
             let meta = manager.set(&args.name, options)?;
             eprintln!(
@@ -507,8 +556,9 @@ fn provision(manager: &Manager, name: &str) -> Result<n8n_worktree_manager::mode
 fn open(manager: &Manager, name: &str) -> Result<()> {
     let checkout = manager.checkout_dir(&manager.show(name)?.name);
     let zed_cli = &manager.settings().zed_cli;
+    // No -e: it would replace the project of the front window, and an agent
+    // in a terminal of that window would stop.
     let status = std::process::Command::new(zed_cli)
-        .arg("-e")
         .arg(&checkout)
         .status()
         .with_context(|| format!("starting {zed_cli}"))?;

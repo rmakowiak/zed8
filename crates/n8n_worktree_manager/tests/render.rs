@@ -174,3 +174,22 @@ fn context_without_an_issue_field_takes_the_key_from_the_branch_name() {
     let text = render::context(&settings, &meta, None);
     assert!(text.starts_with("Worktree  beta (slot 0)"), "{text}");
 }
+
+#[test]
+fn worktree_flags_are_merged_into_the_global_overrides_and_win() {
+    let settings = Settings::new("/wt".into(), Secrets::default());
+    let mut meta = golden_meta("beta");
+    meta.flags
+        .insert("136_skill_sync".to_string(), serde_json::json!(true));
+    let env_sh = render::env_sh(&settings, &meta);
+    assert!(env_sh.contains(
+        "export N8N_FEATURE_FLAG_OVERRIDES='{\"111_context_preferences\":\"variant\",\"136_skill_sync\":true}'\n"
+    ));
+
+    meta.flags
+        .insert("111_context_preferences".to_string(), serde_json::json!("control"));
+    let env_sh = render::env_sh(&settings, &meta);
+    assert!(env_sh.contains(
+        "export N8N_FEATURE_FLAG_OVERRIDES='{\"111_context_preferences\":\"control\",\"136_skill_sync\":true}'\n"
+    ));
+}

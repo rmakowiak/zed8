@@ -92,11 +92,9 @@ pub fn env_vars(settings: &Settings, meta: &Meta) -> Vec<EnvVar> {
         "INSTANCE_AI_BRAVE_SEARCH_API_KEY",
         &settings.brave_search_api_key,
     ));
-    if !settings.feature_flag_overrides.is_empty() {
-        vars.push(EnvVar::quoted(
-            "N8N_FEATURE_FLAG_OVERRIDES",
-            &settings.feature_flag_overrides,
-        ));
+    let flag_overrides = flag_overrides(settings, meta);
+    if !flag_overrides.is_empty() {
+        vars.push(EnvVar::quoted("N8N_FEATURE_FLAG_OVERRIDES", flag_overrides));
     }
     vars.push(EnvVar::plain(
         "TURBO_CACHE_DIR",
@@ -108,6 +106,26 @@ pub fn env_vars(settings: &Settings, meta: &Meta) -> Vec<EnvVar> {
         }
     }
     vars
+}
+
+fn flag_overrides(settings: &Settings, meta: &Meta) -> String {
+    if meta.flags.is_empty() {
+        // The text from secrets.env as written, so the output equals the Bash version.
+        return settings.feature_flag_overrides.clone();
+    }
+    // A global value that is not a JSON object cannot be merged, so the
+    // worktree flags replace it.
+    let mut merged = serde_json::from_str::<serde_json::Value>(&settings.feature_flag_overrides)
+        .ok()
+        .and_then(|value| match value {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    for (key, value) in &meta.flags {
+        merged.insert(key.clone(), value.clone());
+    }
+    serde_json::Value::Object(merged).to_string()
 }
 
 pub fn env_sh(settings: &Settings, meta: &Meta) -> String {

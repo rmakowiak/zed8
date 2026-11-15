@@ -61,6 +61,10 @@ pub struct Meta {
     pub issue: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<Setup>,
+    /// Feature flag overrides of this worktree only. They are merged into
+    /// FEATURE_FLAG_OVERRIDES from secrets.env, and win on the same key.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub flags: serde_json::Map<String, serde_json::Value>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -82,6 +86,7 @@ impl Meta {
             ports: Ports::for_slot(slot),
             issue: None,
             setup: None,
+            flags: serde_json::Map::new(),
             extra: serde_json::Map::new(),
         }
     }

@@ -2,7 +2,7 @@
 
 This plan adds Linear to Zed8 and replaces the Bash tool `n8n-wt` with a Rust crate, `n8n_worktree_manager`. Zed8 uses the crate as a library. The terminal and Raycast Workbench use its binary, `n8n-worktree-manager`.
 
-Status (2026-11-15): phases 1, 2 and 4 are built. The crate `crates/n8n_worktree_manager` has 32 tests, all green, and clippy is clean. Phase 3 (cutover) and phase 5 (Zed8 Work panel) are next.
+Status (2026-11-15): phases 1, 2 and 4 are built, and phase 3 (cutover) is done up to the app install. The crate `crates/n8n_worktree_manager` has 36 tests, all green, and clippy is clean. Phase 5 (Zed8 Work panel) is next.
 
 Backlog of ideas from the review: the Apple Notes note "Zed8 backlog".
 
@@ -178,10 +178,16 @@ What changed from the plan while building:
 - `context` takes the issue title from `cache/linear-issues.json`, which `linear issues` writes. It needs no network.
 - The hidden commands `telemetry up|down|status|tail` and `sandbox up|down|status` keep the old calls working, for example the one in `crates/plannotator_review/src/tools.rs`.
 
-Known gap: `set` and `sync` rewrite the whole `env.sh`. A hand edit is lost. Today `pr-43011` has a hand-added flag in `N8N_FEATURE_FLAG_OVERRIDES`. A per-worktree flag field in `meta.json` would fix this.
+Worktree flags: `set <name> --flag 136_skill_sync=true` writes the flag to `"flags"` in `meta.json`, and `--no-flag <key>` removes it. The flags are merged into `FEATURE_FLAG_OVERRIDES` from `secrets.env`, and a worktree flag wins on the same key. `set` and `sync` still rewrite the whole `env.sh`, so a hand edit is lost. Put flags in `meta.json` instead. The hand-added flag of `pr-43011` is moved there.
 
-Parity check: for all 15 real worktrees, the Rust `env.sh`, `.env`, `.zed/tasks.json` and `.zed/settings.json` equal the Bash files, except for the hand edit above.
+Parity check: for all 15 real worktrees, the Rust `env.sh`, `.env`, `.zed/tasks.json` and `.zed/settings.json` equal the Bash files, except for the hand edit of `pr-43011`, which is now a worktree flag.
 
 Tests by seam: S1 render 7, S2 store 4, S3 API 12, S4 binary 2, S5 Linear 7, plus the Bash golden files in `tests/golden` (`generate.sh` makes them again).
 
-Cutover steps left (phase 3): run `zed8/bundle.sh` and `zed8/install.sh`, link `~/.local/bin/n8n-wt` to the new binary, add `LINEAR_API_KEY` to `secrets.env`, add the SessionStart hook (`n8n-worktree-manager context`), switch Workbench to `list --json`, remove the `create_worktree` hook and the CLAUDE.md blocks.
+Cutover (phase 3), 2026-11-15:
+
+- Done: the SessionStart hook in `~/.claude/settings.json`, the empty `~/.config/zed/tasks.json` (no `adopt` hook), the CLAUDE.md blocks removed from the 7 checkouts (each file equals HEAD again, skip-worktree cleared), and `install.sh` links `~/.local/bin/n8n-wt` to the new binary.
+- Raycast `go.ts` runs `n8n-worktree-manager create <name> --branch <branch> --open --notify`, and `worktrees.ts` reads `list --json`. The change takes effect after `npm run dev` in `raycast/`.
+- `create --branch` now covers `go`. It returns the worktree whose checkout is on the branch (read from git, not meta.json), and it fetches over the HTTPS URL of origin, because a Raycast shell has no SSH key. `--notify` (any command) shows a macOS notification at the end.
+- Old calls keep working: `ls`, `rm`, `down`, `create --skip-build`, `create --no-open`. `open` has no `-e`, so it focuses the window of the worktree and never replaces the project of the front window.
+- Left: the app install (quit Zed8), `npm run dev` for Raycast, and `LINEAR_API_KEY` in `secrets.env`.

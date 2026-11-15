@@ -57,6 +57,8 @@ pub struct SetOptions {
     pub queue: Option<bool>,
     /// Shared services to switch on or off, by name: `sandbox`, `telemetry`.
     pub services: Vec<(String, bool)>,
+    /// Feature flags of this worktree to set, by key. `None` removes the key.
+    pub flags: Vec<(String, Option<serde_json::Value>)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -117,6 +119,11 @@ impl Manager {
         if self.store.meta_path(&name).is_file() {
             return self.show(&name);
         }
+        if let Some(branch) = &options.branch
+            && let Some(meta) = self.find_by_branch(branch)?
+        {
+            return Ok(meta);
+        }
         if self.worktree_dir(&name).exists() {
             bail!(
                 "{} exists but has no meta.json. Move it away or pick another name.",
@@ -142,6 +149,16 @@ impl Manager {
                 .args(args.iter().copied())
         };
 
+        let origin = self.fetch_url(&source_repo)?;
+        let fetch = |branch: &str| {
+            git(&[
+                "fetch",
+                "--quiet",
+                &origin,
+                &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
+            ])
+        };
+
         let meta = self.store.claim(|slot| {
             let mut meta = Meta::new(
                 &name,
@@ -162,8 +179,7 @@ impl Manager {
         let added = (|| -> Result<()> {
             if options.branch.is_some() {
                 // A missing remote branch is normal for a new Linear branch.
-                self.system
-                    .run(&git(&["fetch", "origin", &branch, "--quiet"]))?;
+                self.system.run(&fetch(&branch))?;
                 let local_ref = format!("refs/heads/{branch}");
                 if self
                     .system
@@ -198,7 +214,7 @@ impl Manager {
                     return Ok(());
                 }
             }
-            self.run(&git(&["fetch", "origin", &options.base, "--quiet"]))?;
+            self.run(&fetch(&options.base))?;
             let new_from = format!("origin/{}", options.base);
             self.run(&git(&[
                 "worktree",
@@ -306,6 +322,12 @@ impl Manager {
                 other => bail!("Unknown service '{other}'. Known: sandbox, telemetry."),
             }
         }
+        for (key, value) in options.flags {
+            match value {
+                Some(value) => meta.flags.insert(key, value),
+                None => meta.flags.remove(&key),
+            };
+        }
         self.store.write(&meta)?;
         if self.worktree_dir(&meta.name).join("env.sh").is_file() {
             self.write_files(&meta)?;
@@ -314,6 +336,47 @@ impl Manager {
             }
         }
         Ok(meta)
+    }
+
+    /// The worktree whose checkout is on `branch`. It reads git, not
+    /// meta.json, because the branch can change after create.
+    fn find_by_branch(&self, branch: &str) -> Result<Option<Meta>> {
+        for meta in self.list()? {
+            let checkout = self.checkout_dir(&meta.name);
+            let output = self.system.run(
+                &Command::new("git")
+                    .arg("-C")
+                    .arg(checkout.to_string_lossy())
+                    .args(["branch", "--show-current"]),
+            )?;
+            if output.success && output.stdout.trim() == branch {
+                return Ok(Some(meta));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The HTTPS URL of a GitHub origin. A shell that Raycast starts has no
+    /// unlocked SSH key, and n8n-io/n8n is public, so HTTPS needs no key.
+    fn fetch_url(&self, source_repo: &Path) -> Result<String> {
+        let output = self.system.run(
+            &Command::new("git")
+                .arg("-C")
+                .arg(source_repo.to_string_lossy())
+                .args(["remote", "get-url", "origin"]),
+        )?;
+        let url = output.stdout.trim();
+        if !output.success || url.is_empty() {
+            return Ok("origin".to_string());
+        }
+        let https = if let Some(path) = url.strip_prefix("git@github.com:") {
+            format!("https://github.com/{path}")
+        } else if let Some(path) = url.strip_prefix("ssh://git@github.com/") {
+            format!("https://github.com/{path}")
+        } else {
+            url.to_string()
+        };
+        Ok(https)
     }
 
     /// Rewrites the generated files of a worktree: env.sh, the compose files,
