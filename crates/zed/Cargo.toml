@@ -169,6 +169,7 @@ miniprofiler_ui.workspace = true
 node_runtime.workspace = true
 notifications.workspace = true
 plannotator_review.workspace = true
+work_panel.workspace = true
 thread_board.workspace = true
 onboarding.workspace = true
 outline.workspace = true

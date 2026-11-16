@@ -175,6 +175,25 @@ fn gh(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Posts `body_file` as a comment on the PR, with `attachments` uploaded
+/// by `gh pr comment --attach` (gh 2.99 or newer). Returns the comment URL.
+pub fn post_pr_comment(root: &Path, pr: u64, body_file: &Path, attachments: &[std::path::PathBuf]) -> Result<String> {
+    let mut args = vec!["pr".to_string(), "comment".to_string(), pr.to_string(), "--body-file".to_string()];
+    args.push(body_file.display().to_string());
+    for attachment in attachments {
+        args.push("--attach".to_string());
+        args.push(attachment.display().to_string());
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match gh(root, &args) {
+        Ok(output) => Ok(output.trim().to_string()),
+        Err(error) if error.to_string().contains("unknown flag: --attach") => Err(anyhow::anyhow!(
+            "This gh is too old to attach screenshots. Update gh to 2.99 or newer."
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 /// The labels and the preview of the PR, from `gh`.
 pub fn fetch_pr_tools(root: &Path, pr: u64) -> Result<PrTools> {
     let json = gh(root, &["pr", "view", &pr.to_string(), "--json", "labels,comments"])?;
@@ -319,6 +338,32 @@ impl LocalN8n {
     }
 }
 
+/// The Linear workspace of the issue links.
+const LINEAR_WORKSPACE: &str = "n8n";
+
+pub fn linear_issue_url(key: &str) -> String {
+    format!("https://linear.app/{LINEAR_WORKSPACE}/issue/{key}")
+}
+
+/// The Linear issue of the worktree: the `issue` field of its `meta.json`,
+/// else the key in the branch name, else a key in the PR title. The same
+/// order as `n8n-worktree-manager context`, plus the title for a PR whose
+/// branch has no key.
+pub fn linear_issue(root: Option<&Path>, branch: Option<&str>, pr_title: Option<&str>) -> Option<String> {
+    let from_meta = root
+        .and_then(|root| root.parent())
+        .and_then(|dir| std::fs::read(dir.join("meta.json")).ok())
+        .and_then(|text| serde_json::from_slice::<serde_json::Value>(&text).ok())
+        .and_then(|meta| meta.get("issue")?.as_str().map(str::to_string));
+    from_meta
+        .or_else(|| branch.and_then(n8n_worktree_manager::linear::issue_key_from_branch))
+        .or_else(|| {
+            pr_title?
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+                .find_map(n8n_worktree_manager::linear::issue_key_from_branch)
+        })
+}
+
 fn port_is_open(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
@@ -348,6 +393,30 @@ pub fn local_n8n(root: &Path) -> Option<LocalN8n> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_linear_issue_comes_from_meta_then_the_branch_then_the_pr_title() {
+        let home = tempfile::tempdir().expect("temp dir");
+        let root = home.path().join("context-429").join("n8n");
+        std::fs::create_dir_all(&root).expect("checkout");
+        let title = Some("feat(core): Review updates (CONTEXT-431)");
+
+        assert_eq!(
+            linear_issue(Some(&root), Some("cat-bot/run-43401128653-1"), title).as_deref(),
+            Some("CONTEXT-431")
+        );
+        assert_eq!(
+            linear_issue(Some(&root), Some("context-428-show-each-source"), title).as_deref(),
+            Some("CONTEXT-428")
+        );
+        std::fs::write(root.parent().expect("dir").join("meta.json"), r#"{"issue":"CONTEXT-429"}"#)
+            .expect("meta");
+        assert_eq!(
+            linear_issue(Some(&root), Some("context-428-show-each-source"), title).as_deref(),
+            Some("CONTEXT-429")
+        );
+        assert_eq!(linear_issue(None, Some("main"), Some("chore: Bump deps")), None);
+    }
 
     #[test]
     fn reads_the_preview_comment() {

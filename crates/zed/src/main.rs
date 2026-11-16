@@ -778,6 +778,7 @@ fn main() {
         git_ui::init(cx);
         plannotator_review::init(cx);
         thread_board::init(cx);
+        work_panel::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
         tabular_data_preview::init(cx);

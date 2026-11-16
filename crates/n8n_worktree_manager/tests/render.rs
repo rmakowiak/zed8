@@ -120,6 +120,7 @@ fn context_prints_the_issue_the_ports_and_the_urls() {
         identifier: "CONTEXT-424".to_string(),
         title: "Skill Sync dashboard: add the P3 events".to_string(),
         status: "In Progress".to_string(),
+        status_type: String::new(),
         project: Some("Skill Sync".to_string()),
         url: "https://linear.app/n8n/issue/CONTEXT-424".to_string(),
         branch_name: None,

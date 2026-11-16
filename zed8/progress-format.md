@@ -37,6 +37,8 @@ One JSON object. Every field is optional. Write the whole object each time, with
 | Agent review | `pr-review` | Plan, Lenses, Findings, Post |
 | Manual test | `manual-test` | Charter, Instance, Run, Results |
 | Guided review | `zed-guided-review` | Guide, Chapters, Feedback |
+| Verify | `review-verify` | Read, Check, Rerun, Result |
+| Fix | `review-fix` | Read, Fix, Push, Answers |
 
 Write the file with one shell command, for example:
 

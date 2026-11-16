@@ -95,8 +95,20 @@ def inside(path, roots):
 
 
 def zed_takes(session):
-    roots = zed_roots()
-    if not roots or not session:
+    if not session:
+        return False
+    # The Review panel announces its worktrees every 2 seconds. Ask again for
+    # a moment, so a window that is just opening, or that lost a worktree for
+    # a moment, still takes the session.
+    for _ in range(6):
+        if zed_takes_now(session, zed_roots()):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def zed_takes_now(session, roots):
+    if not roots:
         return False
     target = os.path.realpath(session.get("target") or "")
     if session.get("mode") == "annotate":
@@ -108,7 +120,9 @@ def zed_takes(session):
     if session.get("mode") == "plan":
         return any(inside(cwd, roots) for cwd in ancestor_cwds(session.get("pid", 0)))
     if session.get("mode") == "review":
-        return inside(target, roots)
+        if inside(target, roots):
+            return True
+        return any(inside(cwd, roots) for cwd in ancestor_cwds(session.get("pid", 0)))
     return False
 
 

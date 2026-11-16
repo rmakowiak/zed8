@@ -1,3 +1,4 @@
+pub mod github;
 pub mod linear;
 pub mod model;
 mod provision;
@@ -12,7 +13,7 @@ use anyhow::{Context as _, Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use model::{Meta, Setup};
+use model::{Meta, Ports, Setup};
 use settings::Settings;
 use store::{Store, read_meta};
 use system::{Command, System};
@@ -171,7 +172,13 @@ impl Manager {
             ])
         };
 
-        let meta = self.store.claim(|slot| {
+        let usable = |slot: u16| {
+            Ports::for_slot(slot)
+                .own()
+                .iter()
+                .all(|port| self.system.port_free(*port))
+        };
+        let meta = self.store.claim(usable, |slot| {
             let mut meta = Meta::new(
                 &name,
                 slot,
@@ -263,11 +270,38 @@ impl Manager {
         Ok(linear::join(issues, &self.list()?))
     }
 
+    /// A project, and its issues joined with the worktrees, in the same
+    /// order as `project.issues`.
+    pub fn project(
+        &self,
+        linear: &linear::Linear,
+        id: &str,
+    ) -> Result<(linear::ProjectView, Vec<linear::IssueRow>)> {
+        let project = linear.project_view(id)?;
+        let issues = project.issues.iter().map(|issue| issue.issue.clone()).collect();
+        let rows = linear::join(issues, &self.list()?);
+        Ok((project, rows))
+    }
+
+    /// The issues of the last `issues` call, from the cache file, joined with
+    /// the worktrees of now. No network, so a panel can show them at once.
+    pub fn cached_issues(&self) -> Result<Vec<linear::IssueRow>> {
+        let issues = linear::read_cache(&self.settings.wt_home);
+        Ok(linear::join(issues, &self.list()?))
+    }
+
     /// Moves the issue to In Progress, then creates its worktree on the
     /// Linear branch name, with the issue key in `meta.json`. Provision is
     /// the next step.
-    pub fn start(&self, linear: &linear::Linear, key: &str) -> Result<Meta> {
-        let started = linear.start_issue(key)?;
+    /// Creates the worktree of an issue on its Linear branch. With
+    /// `move_issue`, an issue that is not started moves to In Progress first.
+    /// Without it, nothing is written to Linear.
+    pub fn start(&self, linear: &linear::Linear, key: &str, move_issue: bool) -> Result<Meta> {
+        let started = if move_issue {
+            linear.start_issue(key)?
+        } else {
+            linear.issue_for_start(key)?
+        };
         let mut options = CreateOptions::new(&started.identifier.to_lowercase());
         if !started.branch_name.is_empty() {
             options.branch = Some(started.branch_name.clone());

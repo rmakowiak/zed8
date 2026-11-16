@@ -17,16 +17,26 @@ pub enum ReviewAction {
     AgentReview,
     ManualTest,
     GuidedReview,
+    /// Checks the fixes against the round before. Not a card of its own.
+    Verify,
+    /// Fixes your own PR from a round of the review draft. Not a card.
+    Fix,
 }
 
 impl ReviewAction {
+    /// The cards of the Review panel.
     pub const ALL: [ReviewAction; 3] = [Self::AgentReview, Self::ManualTest, Self::GuidedReview];
+    /// Every action whose thread and progress Zed follows.
+    pub const TRACKED: [ReviewAction; 5] =
+        [Self::AgentReview, Self::ManualTest, Self::GuidedReview, Self::Verify, Self::Fix];
 
     pub fn key(self) -> &'static str {
         match self {
             Self::AgentReview => "agent-review",
             Self::ManualTest => "manual-test",
             Self::GuidedReview => "guided-review",
+            Self::Verify => "verify",
+            Self::Fix => "fix",
         }
     }
 
@@ -36,6 +46,8 @@ impl ReviewAction {
             Self::AgentReview => "Agent review",
             Self::ManualTest => "Manual test",
             Self::GuidedReview => "Guided review",
+            Self::Verify => "Verify",
+            Self::Fix => "Fix",
         }
     }
 
@@ -44,6 +56,8 @@ impl ReviewAction {
             Self::AgentReview => "Claude reviews the PR: plan, lenses, findings. You approve each gate.",
             Self::ManualTest => "Claude writes a test charter, starts n8n and runs it in Chrome.",
             Self::GuidedReview => "Claude explains the change in chapters. You review the code.",
+            Self::Verify => "Claude checks each item of the round before against the new commits.",
+            Self::Fix => "Claude fixes the items of the review draft in this worktree.",
         }
     }
 
@@ -53,6 +67,8 @@ impl ReviewAction {
             Self::AgentReview => &["Plan", "Lenses", "Findings", "Post"],
             Self::ManualTest => &["Charter", "Instance", "Run", "Results"],
             Self::GuidedReview => &["Guide", "Chapters", "Feedback"],
+            Self::Verify => &["Read", "Check", "Rerun", "Result"],
+            Self::Fix => &["Read", "Fix", "Push", "Answers"],
         }
     }
 
@@ -68,6 +84,8 @@ impl ReviewAction {
             Self::AgentReview => "/pr-review",
             Self::ManualTest => "/manual-test",
             Self::GuidedReview => "/zed-guided-review",
+            Self::Verify => "/review-verify",
+            Self::Fix => "/review-fix",
         };
         format!("{skill} --state {}", state_file.display())
     }
@@ -218,7 +236,7 @@ pub fn save_store(dir: &Path, root: &Path, store: &ActionStore) -> anyhow::Resul
 }
 
 pub fn load_progress(dir: &Path, root: &Path) -> BTreeMap<ReviewAction, ActionProgress> {
-    ReviewAction::ALL
+    ReviewAction::TRACKED
         .into_iter()
         .filter_map(|action| {
             let bytes = std::fs::read(progress_path(dir, root, action)).ok()?;

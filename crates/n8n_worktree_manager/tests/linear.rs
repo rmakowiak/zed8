@@ -47,6 +47,7 @@ fn my_issues_parses_the_answer_and_asks_only_for_open_issues() {
                 identifier: "CONTEXT-424".to_string(),
                 title: "Skill Sync dashboard: add the P3 events".to_string(),
                 status: "In Progress".to_string(),
+                status_type: "started".to_string(),
                 project: Some("Skill Sync".to_string()),
                 url: "https://linear.app/n8n/issue/CONTEXT-424/skill-sync-dashboard".to_string(),
                 branch_name: Some("rmakowiak/context-424-skill-sync-dashboard".to_string()),
@@ -57,6 +58,7 @@ fn my_issues_parses_the_answer_and_asks_only_for_open_issues() {
                 identifier: "CONTEXT-406".to_string(),
                 title: "Skills module: remove unused barrel export".to_string(),
                 status: "Ready for pick up".to_string(),
+                status_type: "unstarted".to_string(),
                 project: None,
                 url: "https://linear.app/n8n/issue/CONTEXT-406".to_string(),
                 branch_name: Some("rmakowiak/context-406-skills-module".to_string()),
@@ -95,6 +97,7 @@ fn issue(identifier: &str, branch: &str) -> IssueSummary {
         identifier: identifier.to_string(),
         title: format!("Title of {identifier}"),
         status: "In Progress".to_string(),
+        status_type: "started".to_string(),
         project: None,
         url: String::new(),
         branch_name: Some(branch.to_string()),
@@ -195,21 +198,37 @@ fn start_does_not_write_when_the_issue_is_started_already() {
 #[test]
 fn projects_with_a_search_put_mine_first_without_duplicates() {
     let transport = FakeTransport::with_answers([r#"{"data":{
-        "mine":{"nodes":[{"id":"p-skill","name":"Skill Sync","url":"u1","state":"started","progress":0.4}]},
+        "mine":{"nodes":[{"id":"p-skill","name":"Skill Sync","url":"u1","state":"started","progress":0.4,
+            "lead":{"isMe":true},"teams":{"nodes":[{"key":"CONTEXT"}]}}]},
         "all":{"nodes":[
-            {"id":"p-other","name":"Skill Store","url":"u2","state":"planned","progress":0},
-            {"id":"p-skill","name":"Skill Sync","url":"u1","state":"started","progress":0.4}
+            {"id":"p-other","name":"Skill Store","url":"u2","state":"planned","progress":0,
+             "lead":null,"teams":{"nodes":[{"key":"AI"}]}},
+            {"id":"p-skill","name":"Skill Sync","url":"u1","state":"started","progress":0.4,
+             "lead":{"isMe":true},"teams":{"nodes":[{"key":"CONTEXT"}]}}
         ]}
     }}"#]);
     let linear = Linear::new(Box::new(transport.clone()));
 
     let projects = linear.projects(Some("skill")).expect("projects");
 
-    let names: Vec<(&str, bool)> = projects
+    let names: Vec<(&str, bool, bool, Option<&str>)> = projects
         .iter()
-        .map(|project| (project.name.as_str(), project.mine))
+        .map(|project| {
+            (
+                project.name.as_str(),
+                project.mine,
+                project.lead_is_me,
+                project.team.as_deref(),
+            )
+        })
         .collect();
-    assert_eq!(names, [("Skill Sync", true), ("Skill Store", false)]);
+    assert_eq!(
+        names,
+        [
+            ("Skill Sync", true, true, Some("CONTEXT")),
+            ("Skill Store", false, false, Some("AI"))
+        ]
+    );
     let request: serde_json::Value = serde_json::from_str(&transport.requests()[0]).expect("JSON");
     assert_eq!(request["variables"]["search"], "skill");
 }
@@ -229,4 +248,58 @@ fn the_issue_preview_returns_the_issue_and_fails_for_an_unknown_key() {
 
     let error = linear.issue("CONTEXT-999").expect_err("unknown key");
     assert!(error.to_string().contains("CONTEXT-999"), "{error}");
+}
+
+#[test]
+fn the_project_view_has_milestones_issues_with_their_milestone_and_the_latest_update() {
+    let answer = r#"{"data":{"project":{
+        "id":"p1","name":"Skill Sync","url":"https://linear.app/n8n/project/skill-sync",
+        "state":"started","progress":0.72,"description":"Sync skills from GitHub.",
+        "targetDate":"2026-11-30","lead":{"name":"Roman"},
+        "projectMilestones":{"nodes":[
+            {"name":"P3: Later","targetDate":null,"progress":0,"sortOrder":2},
+            {"name":"P2: Update sync","targetDate":null,"progress":71.67,"sortOrder":1}]},
+        "issues":{"nodes":[
+            {"identifier":"CONTEXT-424","title":"Dashboard","url":"u1","branchName":"b1","priority":0,
+             "state":{"name":"Ready for pick up","type":"unstarted"},"project":{"name":"Skill Sync"},
+             "assignee":null,"projectMilestone":{"name":"P3: Later"}},
+            {"identifier":"CONTEXT-300","title":"Old one","url":"u2","branchName":"b2","priority":0,
+             "state":{"name":"Done","type":"completed"},"project":{"name":"Skill Sync"},
+             "assignee":null,"projectMilestone":null},
+            {"identifier":"CONTEXT-301","title":"Same as 300","url":"u3","branchName":"b3","priority":0,
+             "state":{"name":"Duplicate","type":"duplicate"},"project":{"name":"Skill Sync"},
+             "assignee":null,"projectMilestone":null}]},
+        "documents":{"nodes":[{"title":"Build spec","url":"https://notion.so/spec"}]},
+        "projectUpdates":{"nodes":[{"body":"On track.","createdAt":"2026-11-14T10:00:00Z","user":{"name":"Roman"}}]}
+    }}}"#;
+    let transport = FakeTransport::with_answers([answer]);
+    let linear = Linear::new(Box::new(transport.clone()));
+
+    let project = linear.project_view("p1").expect("project");
+
+    assert_eq!(project.name, "Skill Sync");
+    assert_eq!(project.lead.as_deref(), Some("Roman"));
+    let milestones: Vec<(&str, u32)> = project
+        .milestones
+        .iter()
+        .map(|milestone| (milestone.name.as_str(), milestone.percent.round() as u32))
+        .collect();
+    assert_eq!(milestones, [("P2: Update sync", 72), ("P3: Later", 0)]);
+    let issues: Vec<(&str, Option<&str>, bool)> = project
+        .issues
+        .iter()
+        .map(|issue| (issue.issue.identifier.as_str(), issue.milestone.as_deref(), issue.finished))
+        .collect();
+    assert_eq!(
+        issues,
+        [
+            ("CONTEXT-424", Some("P3: Later"), false),
+            ("CONTEXT-300", None, true),
+            ("CONTEXT-301", None, true)
+        ]
+    );
+    let update = project.latest_update.expect("latest update");
+    assert_eq!((update.author.as_str(), update.body.as_str()), ("Roman", "On track."));
+    assert_eq!(project.documents[0].title, "Build spec");
+    assert!(transport.requests()[0].contains("projectMilestone { name }"));
 }

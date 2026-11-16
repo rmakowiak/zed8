@@ -152,6 +152,7 @@ members = [
     "crates/mistral",
     "crates/multi_buffer",
     "crates/n8n_worktree_manager",
+    "crates/work_panel",
     "crates/net",
     "crates/node_runtime",
     "crates/notifications",
@@ -429,6 +430,7 @@ miniprofiler_ui = { path = "crates/miniprofiler_ui" }
 mistral = { path = "crates/mistral" }
 multi_buffer = { path = "crates/multi_buffer" }
 n8n_worktree_manager = { path = "crates/n8n_worktree_manager" }
+work_panel = { path = "crates/work_panel" }
 net = { path = "crates/net" }
 node_runtime = { path = "crates/node_runtime" }
 notifications = { path = "crates/notifications" }

@@ -95,6 +95,9 @@ enum Commands {
     /// Move a Linear issue to In Progress, create its worktree and set it up.
     Start {
         key: String,
+        /// Leave the issue's status as it is, for example to review someone else's work.
+        #[arg(long)]
+        no_move: bool,
         #[arg(long)]
         no_provision: bool,
         /// Open the worktree in Zed after create.
@@ -569,12 +572,18 @@ fn run(manager: &Manager, command: Commands) -> Result<()> {
         }
         Commands::Start {
             key,
+            no_move,
             no_provision,
             open: open_after,
         } => {
-            let meta = manager.start(&manager.linear(), &key)?;
+            let meta = manager.start(&manager.linear(), &key, !no_move)?;
+            let status = if no_move {
+                "keeps its status"
+            } else {
+                "is In Progress"
+            };
             eprintln!(
-                "{} is In Progress. Worktree '{}' on branch {}",
+                "{} {status}. Worktree '{}' on branch {}",
                 key.to_uppercase(),
                 meta.name,
                 meta.branch

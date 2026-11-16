@@ -82,7 +82,7 @@ fn a_claim_takes_the_lowest_free_slot() {
     let (_home, store) = store_with_slots(&[0, 1, 3]);
 
     let meta = store
-        .claim(|slot| meta_for("new-one", slot))
+        .claim(|_| true, |slot| meta_for("new-one", slot))
         .expect("claim");
 
     assert_eq!(meta.slot, 2);
@@ -102,7 +102,7 @@ fn a_claim_fails_when_all_fifty_slots_are_taken() {
     let (_home, store) = store_with_slots(&all);
 
     let error = store
-        .claim(|slot| meta_for("one-too-many", slot))
+        .claim(|_| true, |slot| meta_for("one-too-many", slot))
         .expect_err("no slot is free");
 
     assert!(
@@ -120,7 +120,7 @@ fn claims_at_the_same_time_get_different_slots() {
             std::thread::spawn(move || {
                 let name = format!("parallel-{index}");
                 Store::new(wt_home)
-                    .claim(|slot| meta_for(&name, slot))
+                    .claim(|_| true, |slot| meta_for(&name, slot))
                     .map(|meta| meta.slot)
             })
         })

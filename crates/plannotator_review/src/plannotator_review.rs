@@ -8,6 +8,8 @@
 mod actions;
 mod chapter_view;
 mod client;
+mod controls;
+mod draft_view;
 mod feedback;
 mod findings;
 mod guide;
@@ -18,6 +20,8 @@ mod panel;
 mod panel_state;
 mod paths;
 mod resume;
+mod review_round;
+mod review_send;
 mod rich_text;
 mod session;
 mod spec_doc;

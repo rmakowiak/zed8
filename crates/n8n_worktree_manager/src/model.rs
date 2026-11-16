@@ -19,6 +19,21 @@ pub struct Ports {
 }
 
 impl Ports {
+    /// The ports of this slot only. The sandbox and telemetry ports are
+    /// shared by all worktrees.
+    pub fn own(&self) -> [u16; 8] {
+        [
+            self.postgres,
+            self.redis,
+            self.mailpit_smtp,
+            self.mailpit_http,
+            self.pgweb,
+            self.n8n,
+            self.editor,
+            self.broker,
+        ]
+    }
+
     pub fn for_slot(slot: u16) -> Self {
         Self {
             postgres: 25432 + slot,
@@ -166,6 +181,14 @@ impl Setup {
     }
 
     /// One line for lists: "pending", "running: install", "failed at install", "done".
+    /// The steps done and the steps this setup runs, for "setting up 3/6".
+    pub fn progress(&self) -> (usize, usize) {
+        let runs = |step: &Step| self.build || !matches!(step, Step::Build | Step::BadgeBuild);
+        let total = Step::ALL.iter().filter(|step| runs(step)).count();
+        let done = self.done.iter().filter(|step| runs(step)).count();
+        (done, total)
+    }
+
     pub fn summary(&self) -> String {
         match (self.status, self.step) {
             (SetupStatus::Running, Some(step)) => format!("running: {}", step.label()),

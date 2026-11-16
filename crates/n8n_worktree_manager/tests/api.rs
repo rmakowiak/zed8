@@ -2,6 +2,7 @@ use n8n_worktree_manager::linear::{FakeTransport, Linear};
 use n8n_worktree_manager::model::{SetupStatus, Step};
 use n8n_worktree_manager::settings::{Secrets, Settings};
 use n8n_worktree_manager::system::{FakeSystem, Output};
+use n8n_worktree_manager::github::Checks;
 use n8n_worktree_manager::{CreateOptions, Manager, SetOptions, TeardownOptions};
 use pretty_assertions::assert_eq;
 use std::fs;
@@ -441,7 +442,7 @@ fn start_moves_the_issue_and_creates_a_worktree_on_the_linear_branch() {
         .system
         .fail(&format!("git -C {} show-ref", setup.source.display()));
 
-    let meta = setup.manager.start(&linear, "CONTEXT-406").expect("start");
+    let meta = setup.manager.start(&linear, "CONTEXT-406", true).expect("start");
 
     assert_eq!(meta.name, "context-406");
     assert_eq!(meta.branch, "rmakowiak/context-406-skills-module");
@@ -735,4 +736,189 @@ fn a_mac_with_only_the_standalone_docker_compose_uses_it() {
         compose.iter().all(|line| line.starts_with("docker-compose ")),
         "{compose:#?}"
     );
+}
+
+#[test]
+fn cached_issues_joins_the_cache_with_the_worktrees_without_linear() {
+    let setup = setup();
+    let mut options = CreateOptions::new("context-424");
+    options.issue = Some("CONTEXT-424".to_string());
+    setup.manager.create(options).expect("create");
+    fs::create_dir_all(setup.wt_home.join("cache")).expect("cache folder");
+    fs::write(
+        setup.wt_home.join("cache/linear-issues.json"),
+        r#"[{"identifier":"CONTEXT-424","title":"Skill Sync dashboard","status":"In Progress",
+            "project":null,"url":"https://linear.app/n8n/issue/CONTEXT-424","branch_name":null,
+            "assignee":null,"priority":2},
+           {"identifier":"CONTEXT-406","title":"Remove the barrel export","status":"Ready for pick up",
+            "project":null,"url":"https://linear.app/n8n/issue/CONTEXT-406","branch_name":null,
+            "assignee":null,"priority":0}]"#,
+    )
+    .expect("cache");
+
+    let rows = setup.manager.cached_issues().expect("cached issues");
+
+    let summary: Vec<(&str, Option<&str>, Option<&str>, Option<(usize, usize)>)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.issue.identifier.as_str(),
+                row.worktree.as_deref(),
+                row.setup.as_deref(),
+                row.setup_progress,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("CONTEXT-424", Some("context-424"), Some("pending"), Some((0, 6))),
+            ("CONTEXT-406", None, None, None),
+        ]
+    );
+}
+
+#[test]
+fn project_joins_its_issues_with_the_worktrees() {
+    let setup = setup();
+    let mut options = CreateOptions::new("context-424");
+    options.issue = Some("CONTEXT-424".to_string());
+    setup.manager.create(options).expect("create");
+    let answer = r#"{"data":{"project":{"id":"p1","name":"Skill Sync","url":"u","state":"started",
+        "progress":0.5,"projectMilestones":{"nodes":[]},"documents":{"nodes":[]},"projectUpdates":{"nodes":[]},
+        "issues":{"nodes":[
+            {"identifier":"CONTEXT-424","title":"Dashboard","url":"u1","branchName":"b1","priority":0,
+             "state":{"name":"In Progress","type":"started"},"project":null,"assignee":null,"projectMilestone":null},
+            {"identifier":"CONTEXT-406","title":"Barrel","url":"u2","branchName":"b2","priority":0,
+             "state":{"name":"Ready for pick up","type":"unstarted"},"project":null,"assignee":null,"projectMilestone":null}]}}}}"#;
+    let linear = Linear::new(Box::new(FakeTransport::with_answers([answer])));
+
+    let (project, rows) = setup.manager.project(&linear, "p1").expect("project");
+
+    assert_eq!(project.issues.len(), 2);
+    let worktrees: Vec<(&str, Option<&str>)> = rows
+        .iter()
+        .map(|row| (row.issue.identifier.as_str(), row.worktree.as_deref()))
+        .collect();
+    assert_eq!(
+        worktrees,
+        [("CONTEXT-424", Some("context-424")), ("CONTEXT-406", None)]
+    );
+}
+
+#[test]
+fn pr_status_reads_the_pr_of_the_branch_and_sums_up_its_checks() {
+    let setup = setup();
+    for name in ["passing", "failing", "running", "no-pr"] {
+        setup
+            .manager
+            .create(CreateOptions::new(name))
+            .expect("create");
+        fs::create_dir_all(setup.wt_home.join(format!("n8n/{name}/n8n"))).expect("checkout");
+    }
+    let pr = |branch: &str, checks: &str| {
+        setup.system.respond(
+            &format!("gh pr list --repo n8n-io/n8n --head {branch} --state all"),
+            Output::ok(&format!(
+                r#"[{{"number":7,"url":"https://github.com/n8n-io/n8n/pull/7","state":"OPEN","statusCheckRollup":{checks}}}]"#
+            )),
+        );
+    };
+    pr(
+        "passing",
+        r#"[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"},
+            {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SKIPPED"},
+            {"__typename":"StatusContext","state":"SUCCESS"}]"#,
+    );
+    pr(
+        "failing",
+        r#"[{"__typename":"CheckRun","status":"COMPLETED","conclusion":"FAILURE"},
+            {"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":""}]"#,
+    );
+    pr(
+        "running",
+        r#"[{"__typename":"CheckRun","status":"IN_PROGRESS","conclusion":""},
+            {"__typename":"CheckRun","status":"COMPLETED","conclusion":"SUCCESS"}]"#,
+    );
+
+    let status = |name: &str| setup.manager.pr_status(name).expect("pr status");
+
+    assert_eq!(status("passing").map(|pr| pr.checks), Some(Checks::Passing));
+    assert_eq!(status("failing").map(|pr| pr.checks), Some(Checks::Failing));
+    assert_eq!(status("running").map(|pr| pr.checks), Some(Checks::Pending));
+    assert_eq!(status("no-pr"), None);
+    let passing = status("passing").expect("a PR");
+    assert_eq!((passing.number, passing.state.as_str()), (7, "OPEN"));
+}
+
+#[test]
+fn pr_status_prefers_an_open_pr_of_the_meta_branch_over_a_closed_one_of_the_checkout() {
+    let setup = setup();
+    setup
+        .manager
+        .create(CreateOptions::new("context-355"))
+        .expect("create");
+    let checkout = setup.wt_home.join("n8n/context-355/n8n");
+    fs::create_dir_all(&checkout).expect("checkout");
+    setup.system.respond(
+        &format!("git -C {} branch --show-current", checkout.display()),
+        Output::ok("cat-bot/run-1\n"),
+    );
+    setup.system.respond(
+        "gh pr list --repo n8n-io/n8n --head cat-bot/run-1 --state all",
+        Output::ok(r#"[{"number":1,"url":"u1","state":"CLOSED","statusCheckRollup":[]}]"#),
+    );
+    setup.system.respond(
+        "gh pr list --repo n8n-io/n8n --head context-355 --state all",
+        Output::ok(r#"[{"number":2,"url":"u2","state":"OPEN","statusCheckRollup":[]}]"#),
+    );
+
+    let pr = setup
+        .manager
+        .pr_status("context-355")
+        .expect("pr status")
+        .expect("a PR");
+
+    assert_eq!((pr.number, pr.state.as_str()), (2, "OPEN"));
+}
+
+#[test]
+fn start_without_the_move_reads_linear_and_writes_nothing() {
+    let setup = setup();
+    let transport = FakeTransport::with_answers([
+        r#"{"data":{"issue":{"id":"uuid-354","identifier":"CONTEXT-354","title":"Source health",
+            "branchName":"someone/context-354-source-health",
+            "state":{"id":"s-ready","name":"Ready for pick up","type":"unstarted"},
+            "team":{"states":{"nodes":[{"id":"s-progress","name":"In Progress","type":"started","position":2}]}}}}}"#,
+    ]);
+    let linear = Linear::new(Box::new(transport.clone()));
+    setup
+        .system
+        .fail(&format!("git -C {} show-ref", setup.source.display()));
+
+    let meta = setup
+        .manager
+        .start(&linear, "CONTEXT-354", false)
+        .expect("start");
+
+    assert_eq!(meta.branch, "someone/context-354-source-health");
+    assert_eq!(meta.issue.as_deref(), Some("CONTEXT-354"));
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].contains("issueUpdate"));
+}
+
+#[test]
+fn create_skips_a_slot_whose_ports_another_program_holds() {
+    let setup = setup();
+    // Containers of a worktree whose folder is gone still hold slot 0's postgres port.
+    setup.system.set_port_busy(25432);
+
+    let meta = setup
+        .manager
+        .create(CreateOptions::new("feature-one"))
+        .expect("create");
+
+    assert_eq!(meta.slot, 1);
+    assert_eq!(meta.ports.postgres, 25433);
 }

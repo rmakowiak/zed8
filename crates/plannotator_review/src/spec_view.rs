@@ -7,6 +7,7 @@
 //! on request, and a footer with Add note, Skip and Accept recommended.
 
 use crate::{
+    controls::ReviewControls,
     rich_text::render_mermaid,
     session::Session,
     spec_doc::{self, Answer, Question, QuestionKind, SpecBlock, SpecComment},
@@ -14,8 +15,8 @@ use crate::{
 };
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    IntoElement, Render, SharedString, SharedUri, Subscription, Task, Window, px,
+    AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
+    IntoElement, Render, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, px,
 };
 use http_client::{HttpClient, Method};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -1007,8 +1008,8 @@ impl SpecReviewView {
             .into_any_element()
     }
 
-    fn render_footer(&self, cx: &Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
+    /// Send feedback and Approve, for the tab and for the card in the Review panel.
+    pub(crate) fn controls(&self, this: WeakEntity<Self>) -> ReviewControls {
         let (answered, questions) = self.answered_count();
         let comments = self.comments().len();
         let ready = matches!(self.status, Status::Ready);
@@ -1017,35 +1018,27 @@ impl SpecReviewView {
             summary.push_str(&format!(" · {answered} of {questions} questions answered"));
         }
         let has_feedback = comments > 0 || answered > 0;
-        h_flex()
-            .w_full()
-            .px_4()
-            .py_2()
-            .gap_2()
-            .border_t_1()
-            .border_color(colors.border_variant)
-            .bg(colors.title_bar_background)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Label::new(summary).size(LabelSize::Small).color(Color::Muted).truncate()),
-            )
-            .child(
-                Button::new("spec-approve", "Approve")
-                    .style(ButtonStyle::Tinted(TintColor::Success))
-                    .start_icon(Icon::new(IconName::Check).size(IconSize::Small))
-                    .disabled(!ready)
-                    .tooltip(Tooltip::text("Tell Claude the spec is approved"))
-                    .on_click(cx.listener(|this, _, _, cx| this.approve(cx))),
-            )
-            .child(
-                Button::new("spec-send", "Send feedback")
-                    .style(ButtonStyle::Filled)
-                    .start_icon(Icon::new(IconName::Send).size(IconSize::Small))
-                    .disabled(!ready || !has_feedback)
-                    .on_click(cx.listener(|this, _, _, cx| this.send_feedback(cx))),
-            )
+        let send = (ready && has_feedback).then(|| {
+            let this = this.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                this.update(cx, |this, cx| this.send_feedback(cx)).ok();
+            }
+        });
+        let approve = ready.then(|| {
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                this.update(cx, |this, cx| this.approve(cx)).ok();
+            }
+        });
+        let controls = ReviewControls::new(format!("spec-{}", self.session.pid), summary)
+            .on_send(send)
+            .on_approve(approve)
+            .approve_tooltip("Tell Claude the spec is approved");
+        match &self.status {
+            Status::Ready => controls.status("Waits on you", Color::Warning),
+            Status::Done { approved: true, .. } => controls.status("Approved", Color::Success),
+            Status::Done { approved: false, .. } => controls.status("Sent", Color::Accent),
+            _ => controls,
+        }
     }
 }
 
@@ -1262,6 +1255,7 @@ impl Render for SpecReviewView {
             .size_full()
             .bg(colors.editor_background)
             .child(self.render_header(cx))
+            .child(self.controls(cx.weak_entity()))
             .children(self.render_banner(cx))
             .child(
                 div()
@@ -1270,6 +1264,5 @@ impl Render for SpecReviewView {
                     .overflow_y_scroll()
                     .child(div().max_w(px(900.)).px_4().py_4().child(body)),
             )
-            .child(self.render_footer(cx))
     }
 }

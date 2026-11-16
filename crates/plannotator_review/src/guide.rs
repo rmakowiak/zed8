@@ -83,6 +83,9 @@ pub struct GuideNote {
     /// Set for a finding of the agent review, which is not part of a guide.
     #[serde(skip)]
     pub finding_id: Option<String>,
+    /// The severity of an agent review finding: Critical, High, Medium, Low or Nit.
+    #[serde(skip)]
+    pub severity: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

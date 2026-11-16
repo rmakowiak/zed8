@@ -13529,6 +13529,7 @@ dependencies = [
  "markdown",
  "menu",
  "multi_buffer",
+ "n8n_worktree_manager",
  "notifications",
  "project",
  "schemars 1.0.4",
@@ -21977,6 +21978,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "work_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "editor",
+ "gpui",
+ "markdown",
+ "menu",
+ "n8n_worktree_manager",
+ "notifications",
+ "serde",
+ "serde_json",
+ "task",
+ "terminal_view",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "workspace"
 version = "0.1.0"
 dependencies = [
@@ -22659,6 +22681,7 @@ dependencies = [
  "which_key",
  "windows 0.62.2",
  "windows_resources",
+ "work_panel",
  "workspace",
  "zed-reqwest",
  "zed_actions",

@@ -9,6 +9,10 @@ use editor::ExportedReviewComment;
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path};
 
+/// The first line of Done at gate 2. `pr-review` reads it and posts nothing,
+/// because the Zed8 review draft posts.
+pub const ZED8_DRAFT_NOTE: &str = "ZED8-DRAFT: Gate 2 is done. The Zed8 review draft posts to GitHub, so do not post anything. Save the findings as step 4 says, mark the run done, and stop.";
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalAnnotation {
@@ -30,6 +34,8 @@ pub struct ExternalAnnotation {
     pub text: String,
     #[serde(default)]
     pub suggested_code: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +79,7 @@ pub fn split(
                     side: annotation.side.clone(),
                     text: annotation.full_text(),
                     finding_id: Some(annotation.id.clone()),
+                    severity: annotation.severity.clone(),
                 });
             }
             _ => general.push(annotation.clone()),
@@ -104,6 +111,19 @@ pub fn general_note(annotation: &ExternalAnnotation) -> GuideNote {
             _ => annotation.full_text(),
         },
         finding_id: Some(annotation.id.clone()),
+        severity: annotation.severity.clone(),
+    }
+}
+
+/// 5 for Critical down to 1 for Nit, 0 for a severity the scale does not have.
+pub fn severity_rank(severity: &str) -> u8 {
+    match severity.to_lowercase().as_str() {
+        "critical" => 5,
+        "high" => 4,
+        "medium" => 3,
+        "low" => 2,
+        "nit" => 1,
+        _ => 0,
     }
 }
 
@@ -160,6 +180,28 @@ mod tests {
         assert!(diffs[0].notes[0].text.contains("```suggestion\nbreak;\n```"));
         assert_eq!(general.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["2", "3", "4"]);
         assert_eq!(general_note(&general[1]).text, "Not on a diff line: owners");
+    }
+
+    #[test]
+    fn findings_keep_their_severity() {
+        let annotations = vec![
+            annotation(r#"{"id":"1","scope":"line","filePath":"a.ts","lineStart":4,"severity":"High","text":"Loop"}"#),
+            annotation(r#"{"id":"2","scope":"line","filePath":"a.ts","lineStart":9,"text":"No severity"}"#),
+            annotation(r#"{"id":"3","scope":"file","filePath":"a.ts","severity":"Low","text":"Not on a diff line: owners"}"#),
+        ];
+        let (diffs, general) = split(&annotations, &["a.ts".into()]);
+        assert_eq!(diffs[0].notes[0].severity.as_deref(), Some("High"));
+        assert_eq!(diffs[0].notes[1].severity, None);
+        assert_eq!(general_note(&general[0]).severity.as_deref(), Some("Low"));
+    }
+
+    #[test]
+    fn severities_rank_from_critical_to_nit() {
+        let ranked: Vec<_> = ["nit", "Low", "Medium", "High", "Critical", "odd"]
+            .into_iter()
+            .map(severity_rank)
+            .collect();
+        assert_eq!(ranked, [1, 2, 3, 4, 5, 0]);
     }
 
     #[test]

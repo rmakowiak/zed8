@@ -38,13 +38,52 @@ pub struct PullRequest {
     /// The branch that the PR merges into, such as `master`.
     #[serde(default)]
     pub base_ref_name: String,
+    #[serde(default)]
+    pub author: Option<Login>,
+    /// `OPEN`, `MERGED` or `CLOSED`.
+    #[serde(default)]
+    pub state: String,
+    /// The people and teams the PR still asks for a review. GitHub drops
+    /// you when you submit a review and adds you again when the author asks again.
+    #[serde(default)]
+    pub review_requests: Vec<ReviewRequestRef>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Login {
+    #[serde(default)]
+    pub login: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ReviewRequestRef {
+    #[serde(default)]
+    pub login: Option<String>,
+}
+
+impl PullRequest {
+    pub fn author_login(&self) -> &str {
+        self.author.as_ref().map(|author| author.login.as_str()).unwrap_or_default()
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.state.is_empty() || self.state == "OPEN"
+    }
+
+    pub fn asks(&self, login: &str) -> bool {
+        !login.is_empty()
+            && self
+                .review_requests
+                .iter()
+                .any(|request| request.login.as_deref().is_some_and(|requested| requested.eq_ignore_ascii_case(login)))
+    }
 }
 
 /// The open GitHub PR of the checked-out branch, from the `gh` CLI.
 pub fn find_pull_request(root: &Path) -> Option<PullRequest> {
     let output = std::process::Command::new("gh")
         .current_dir(root)
-        .args(["pr", "view", "--json", "number,url,title,headRefOid,baseRefName"])
+        .args(["pr", "view", "--json", "number,url,title,headRefOid,baseRefName,author,state,reviewRequests"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -89,15 +128,20 @@ fn ask_claude(
         start_claude(workspace, Some(command), window, cx);
         return;
     };
-    let terminal = target.terminal.clone();
+    send_prompt(target.terminal.clone(), command, window, cx);
+    crate::show_toast(workspace, format!("{done_message} Thread: {}.", target.title), cx);
+}
+
+/// Types `command` into the Claude Code terminal and submits it.
+pub(crate) fn send_prompt(terminal: Entity<Terminal>, command: String, window: &mut Window, cx: &mut App) {
     terminal.update(cx, |terminal, _| terminal.input(command.into_bytes()));
     // Claude Code takes fast input as a paste. A separate Enter submits it.
-    cx.spawn_in(window, async move |_, cx| {
-        cx.background_executor().timer(Duration::from_millis(200)).await;
-        terminal.update(cx, |terminal, _| terminal.input(&b"\r"[..]));
-    })
-    .detach();
-    crate::show_toast(workspace, format!("{done_message} Thread: {}.", target.title), cx);
+    window
+        .spawn(cx, async move |cx| {
+            cx.background_executor().timer(Duration::from_millis(200)).await;
+            terminal.update(cx, |terminal, _| terminal.input(&b"\r"[..]));
+        })
+        .detach();
 }
 
 /// Starts Claude Code in a new terminal of the worktree, with `command` as

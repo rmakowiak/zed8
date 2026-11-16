@@ -2,7 +2,7 @@
 
 This plan adds Linear to Zed8 and replaces the Bash tool `n8n-wt` with a Rust crate, `n8n_worktree_manager`. Zed8 uses the crate as a library. The terminal and Raycast Workbench use its binary, `n8n-worktree-manager`.
 
-Status (2026-11-15): phases 1, 2 and 4 are built, and phase 3 (cutover) is done up to the app install. The crate `crates/n8n_worktree_manager` has 40 tests, all green, and clippy is clean. Phase 5 (Zed8 Work panel) is next.
+Status (2026-11-15): phases 1 to 4 are done, and phase 5 (the Zed8 Work panel, crate `crates/work_panel`) is built and waits for a manual test. `n8n_worktree_manager` has 43 tests, `work_panel` has 1, all green, and clippy is clean.
 
 Backlog of ideas from the review: the Apple Notes note "Zed8 backlog".
 
@@ -193,3 +193,14 @@ Cutover (phase 3), 2026-11-15:
 - Done on 2026-11-15: the app install, the Raycast build, and `LINEAR_API_KEY`. `linear issues` works against the real Linear.
 
 Prune (2026-11-15): `prune --merged` lists the worktrees whose branch (read from git) has a merged PR in n8n-io/n8n, asks once, and tears down the safe ones. It skips a worktree with uncommitted or untracked files (the reason names them), and one whose HEAD is not an ancestor of the merged PR head. A worktree without a checkout holds only generated files, so it is safe. `--json` only lists. `teardown` now finds the source repo with `git rev-parse --git-common-dir` in the checkout, because 3 worktrees had a `source_repo` in meta.json that no longer exists. A background job that only notifies is still in the backlog. The first real prune (8 worktrees) removed folders and git worktrees, but `docker compose down` failed: this Mac has only the standalone `docker-compose`. The containers and volumes were removed by hand. `Settings::load` now checks `docker compose version` and falls back to `docker-compose`, like the Bash `COMPOSE_BIN`.
+
+## Work panel (phase 5), 2026-11-15
+
+The crate `crates/work_panel` adds a right-dock panel with two tabs.
+
+- Up next: your open issues by status (`STATUS_ORDER`), from the cache at once (`Manager::cached_issues`), then from Linear every 5 minutes and on the refresh button. Each row shows the worktree and its setup state. A click opens the issue in the preview tab. On hover: Start work and Open in Linear.
+- Project: your projects, a search box for all projects of the workspace, and the selected project's issues by milestone (`Manager::project`, `Linear::project_view`). Finished issues stay hidden unless you tick the box. Open shows the project tab: milestones, description, the latest update, documents, and your work in it.
+- Preview tabs: one issue tab and one project tab, each reused for the next item.
+- Start work: an issue with a worktree opens it with no question (and runs `provision` if the setup is not done). Otherwise a dialog lists the three steps. Confirm moves the issue to In Progress, creates the worktree, opens it as a group of this window (`MultiWorkspace::find_or_create_local_workspace`), and runs `n8n-worktree-manager provision <name>` as the terminal task "Setup: <name>".
+- Facts from the real Linear: milestone progress is 0 to 100, a project's progress is 0 to 1, milestones come in no useful order (sorted by `sortOrder`), and `duplicate` is a finished state type.
+- Not built yet: `zed://` open from the CLI `open` command, "Start a Claude thread when the setup ends", keyboard navigation in the panel, and the ⌘K actions menu of the mockup.

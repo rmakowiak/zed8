@@ -4,7 +4,10 @@
 //! file buffer, so inline review comments work as in the branch diff.
 
 use crate::{
+    controls,
+    review_round::{self, Item as DraftItem},
     findings::{self, ExternalAnnotation},
+    panel::ReviewPanel,
     guide::{GuideDiff, GuideNote},
     session::Session,
     note_thread::{self, NoteThread, NoteThreadEvent, ThreadDraft},
@@ -20,7 +23,7 @@ use editor::{
 };
 use git_ui_core::file_diff_view::build_buffer_diff;
 use gpui::{
-    Action, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font, FontWeight,
+    Action, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, Font, FontWeight,
     IntoElement, KeyBinding, Render, SharedString, Subscription, Task, WeakEntity, Window, actions, px,
 };
 use schemars::JsonSchema;
@@ -98,6 +101,16 @@ pub struct ChapterIntro {
 pub enum ChapterNavEvent {
     Show(usize),
     ToggleReviewed(usize),
+    SendFeedback,
+    Approve,
+    Draft(DraftChange),
+}
+
+/// A change to the review draft from a tab.
+#[derive(Clone, Debug)]
+pub enum DraftChange {
+    Add(Vec<DraftItem>),
+    Remove(String),
 }
 
 /// Gate 2 of the agent review: the tab shows the whole PR with its findings.
@@ -128,6 +141,11 @@ pub struct ChapterDiffView {
     note_anchors: Vec<Option<Anchor>>,
     /// The last finding you jumped to, by its number.
     current_finding: Option<usize>,
+    /// The Review panel that owns the guided review session. Its state sets
+    /// the Send feedback and Approve bar of a guide chapter.
+    panel: Option<(WeakEntity<ReviewPanel>, Subscription)>,
+    /// The keys of the items in the review draft.
+    draft_keys: std::collections::BTreeSet<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -286,6 +304,8 @@ impl ChapterDiffView {
             note_threads: Vec::new(),
             note_anchors: Vec::new(),
             current_finding: None,
+            panel: None,
+            draft_keys: Default::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -364,12 +384,19 @@ impl ChapterDiffView {
     }
 
     fn subscribe_thread(&mut self, thread: &Entity<NoteThread>, cx: &mut Context<Self>) {
-        self._subscriptions.push(cx.subscribe(thread, |this, _, event, cx| match event {
+        self._subscriptions.push(cx.subscribe(thread, |this, thread, event, cx| match event {
             NoteThreadEvent::RepliesChanged => {
                 this.save_drafts(cx);
                 this.emit_comment_count(cx);
             }
             NoteThreadEvent::FindingChanged { id, text } => this.sync_finding(id, text.clone(), cx),
+            NoteThreadEvent::DraftToggled { add } => {
+                let Some(item) = thread.read(cx).draft_item() else {
+                    return;
+                };
+                let change = if *add { DraftChange::Add(vec![item]) } else { DraftChange::Remove(item.key) };
+                cx.emit(ChapterNavEvent::Draft(change));
+            }
         }));
     }
 
@@ -427,7 +454,7 @@ impl ChapterDiffView {
 
     /// Approve or Send feedback: the findings as you left them, plus your own
     /// inline comments, as one message to the Plannotator session.
-    fn send_findings(&mut self, approved: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn send_findings(&mut self, approved: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(findings) = &self.findings else {
             return;
         };
@@ -445,6 +472,8 @@ impl ChapterDiffView {
             .collect();
         let count = inline.len() + general.len();
         let message = findings::message(&inline, &general, &findings.worktree);
+        // The review draft posts now, so the skill stops after gate 2.
+        let message = if approved { format!("{}\n\n{message}", findings::ZED8_DRAFT_NOTE) } else { message };
         let http = findings.http.clone();
         let url = format!("{}/api/feedback", findings.session.url);
         let workspace = self.workspace.clone();
@@ -452,7 +481,7 @@ impl ChapterDiffView {
             let body = serde_json::json!({ "approved": approved, "feedback": message, "annotations": [] });
             let result = crate::client::send_json(&http, Method::POST, &url, &body).await;
             let toast = match &result {
-                Ok(()) if approved => format!("Approved with {count} comments. The agent review goes on."),
+                Ok(()) if approved => "Gate 2 done. The agent review saves its findings and posts nothing.".to_string(),
                 Ok(()) => format!("Sent {count} comments to the agent review."),
                 Err(error) => format!("Send failed: {error}"),
             };
@@ -546,6 +575,7 @@ impl ChapterDiffView {
                 .hover(move |style| style.bg(hover_bg))
                 .tooltip(Tooltip::text(tooltip))
                 .child(Label::new(index.to_string()).size(LabelSize::XSmall).weight(FontWeight::SEMIBOLD).color(Color::Accent))
+                .children(thread.severity().map(|severity| controls::severity_chip(severity, cx)))
                 .child(
                     Label::new(format!("{file}:{}", thread.line_start()))
                         .size(LabelSize::XSmall)
@@ -568,63 +598,217 @@ impl ChapterDiffView {
         )
     }
 
+    /// The review draft keys, so each finding shows whether it is ticked.
+    pub fn set_draft_keys(&mut self, keys: std::collections::BTreeSet<String>, cx: &mut Context<Self>) {
+        if self.draft_keys == keys {
+            return;
+        }
+        for thread in self.note_threads.iter().chain(self.findings.iter().flat_map(|findings| findings.general.iter())) {
+            let key = thread.read(cx).finding().map(|finding| format!("agent:{}", finding.id));
+            let in_draft = key.is_some_and(|key| keys.contains(&key));
+            thread.update(cx, |thread, cx| thread.set_in_draft(in_draft, cx));
+        }
+        self.draft_keys = keys;
+        cx.notify();
+    }
+
+    fn finding_threads(&self) -> impl Iterator<Item = &Entity<NoteThread>> {
+        self.note_threads.iter().chain(self.findings.iter().flat_map(|findings| findings.general.iter()))
+    }
+
+    /// The findings of gate 2: how many there are and how many are ticked.
+    pub(crate) fn findings_counts(&self, cx: &App) -> Option<(usize, usize)> {
+        self.findings.as_ref()?;
+        let threads: Vec<&Entity<NoteThread>> =
+            self.finding_threads().filter(|thread| thread.read(cx).finding().is_some()).collect();
+        let ticked = threads.iter().filter(|thread| thread.read(cx).in_draft()).count();
+        Some((threads.len(), ticked))
+    }
+
+    /// Whether gate 2 is answered, and how.
+    pub(crate) fn findings_sent(&self) -> Option<bool> {
+        self.findings.as_ref()?.sent
+    }
+
+    /// Ticks every finding of Medium or higher that is not ticked yet.
+    fn tick_medium_and_up(&mut self, cx: &mut Context<Self>) {
+        let items: Vec<DraftItem> = self
+            .finding_threads()
+            .filter(|thread| {
+                let thread = thread.read(cx);
+                !thread.in_draft() && thread.severity().is_some_and(|severity| findings::severity_rank(severity) >= 3)
+            })
+            .filter_map(|thread| thread.read(cx).draft_item())
+            .collect();
+        if !items.is_empty() {
+            cx.emit(ChapterNavEvent::Draft(DraftChange::Add(items)));
+        }
+    }
+
+    /// Moves your inline comments of this tab into the review draft.
+    fn add_comments_to_draft(&mut self, cx: &mut Context<Self>) {
+        let comments = self.rhs_editor(cx).update(cx, |editor, cx| editor.take_review_comments_for_export(cx));
+        let items: Vec<DraftItem> = comments
+            .into_iter()
+            .map(|comment| DraftItem {
+                key: review_round::your_key(&comment.file_path, comment.line_start, &comment.text),
+                source: review_round::Source::You,
+                line: Some(comment.line_start),
+                line_end: (comment.line_end > comment.line_start).then_some(comment.line_end),
+                path: Some(comment.file_path),
+                body: comment.text,
+                include: true,
+                ..Default::default()
+            })
+            .collect();
+        if !items.is_empty() {
+            cx.emit(ChapterNavEvent::Draft(DraftChange::Add(items)));
+        }
+    }
+
+    /// The bar of the tab: what is in the review draft, and Ask Claude and
+    /// Done for the Claude session behind the tab. Nothing here posts.
+    fn render_draft_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let colors = cx.theme().colors().clone();
+        let your_comments = self.editor_comment_count;
+        let (status, color, summary, ask, done, medium) = match &self.findings {
+            Some(findings) => {
+                let (total, ticked) = self.findings_counts(cx).unwrap_or_default();
+                let (status, color) = match findings.sent {
+                    Some(true) => ("Done", Color::Success),
+                    Some(false) => ("Sent to the agent review", Color::Accent),
+                    None => ("Gate 2 · waits on you", Color::Warning),
+                };
+                let untick_medium = self.finding_threads().any(|thread| {
+                    let thread = thread.read(cx);
+                    !thread.in_draft() && thread.severity().is_some_and(|severity| findings::severity_rank(severity) >= 3)
+                });
+                let open = findings.sent.is_none();
+                (status.to_string(), color, format!("{ticked} of {total} in draft"), open, open, untick_medium)
+            }
+            None => {
+                let panel = self.panel.as_ref()?.0.upgrade()?;
+                let status = panel.read(cx).guided_status(cx);
+                let count = self.review_comment_count(cx);
+                let summary = match self.draft_keys.iter().filter(|key| key.starts_with("you:")).count() {
+                    0 => "Tick comments into the draft, or ask Claude".to_string(),
+                    count => format!("{count} of your comments in draft"),
+                };
+                (status.text, status.color, summary, status.has_session && count > 0, status.has_session, false)
+            }
+        };
+        let this = cx.weak_entity();
+        let findings_mode = self.findings.is_some();
+        Some(
+            h_flex()
+                .w_full()
+                .flex_wrap()
+                .px_3()
+                .py_2()
+                .gap_2()
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .bg(colors.title_bar_background)
+                .child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(color))
+                        .child(Label::new(status).size(LabelSize::Small).color(color)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(120.))
+                        .child(Label::new(summary).size(LabelSize::Small).color(Color::Accent).truncate()),
+                )
+                .when(medium, |bar| {
+                    bar.child(
+                        Button::new("tick-medium", "Tick Medium and up")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| this.tick_medium_and_up(cx))),
+                    )
+                })
+                .when(your_comments > 0, |bar| {
+                    bar.child(
+                        Button::new("add-comments-to-draft", format!("Add {your_comments} to draft"))
+                            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::Plus).size(IconSize::XSmall))
+                            .tooltip(Tooltip::text("Moves your inline comments of this tab into the review draft"))
+                            .on_click(cx.listener(|this, _, _, cx| this.add_comments_to_draft(cx))),
+                    )
+                })
+                .child(
+                    Button::new("ask-claude", "Ask Claude")
+                        .style(ButtonStyle::Outlined)
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::Send).size(IconSize::XSmall))
+                        .disabled(!ask)
+                        .tooltip(Tooltip::text(if findings_mode {
+                            "Sends your edits and comments to the agent review. It revises the findings."
+                        } else {
+                            "Sends your comments and replies to Claude in the review session. Claude answers there."
+                        }))
+                        .on_click({
+                            let this = this.clone();
+                            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                this.update(cx, |this, cx| {
+                                    if this.findings.is_some() {
+                                        this.send_findings(false, window, cx)
+                                    } else {
+                                        cx.emit(ChapterNavEvent::SendFeedback)
+                                    }
+                                })
+                                .ok();
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("review-done", "Done")
+                        .style(ButtonStyle::Filled)
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Success))
+                        .disabled(!done)
+                        .tooltip(Tooltip::text(if findings_mode {
+                            "Ends gate 2. The agent review saves its findings and posts nothing: the review draft posts."
+                        } else {
+                            "Tells Claude that you finished this review session."
+                        }))
+                        .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| {
+                                if this.findings.is_some() {
+                                    this.send_findings(true, window, cx)
+                                } else {
+                                    cx.emit(ChapterNavEvent::Approve)
+                                }
+                            })
+                            .ok();
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Follows the Review panel, for the guided review bar of this chapter.
+    pub(crate) fn follow_panel(&mut self, panel: &Entity<ReviewPanel>, cx: &mut Context<Self>) {
+        let subscription = cx.observe(panel, |_, _, cx| cx.notify());
+        self.panel = Some((panel.downgrade(), subscription));
+        cx.notify();
+    }
+
     fn render_findings_header(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let findings = self.findings.as_ref()?;
         let colors = cx.theme().colors();
-        let inline = self.note_threads.iter().filter(|thread| thread.read(cx).finding().is_some()).count();
-        let edited = self
-            .note_threads
-            .iter()
-            .chain(&findings.general)
-            .filter(|thread| thread.read(cx).finding().is_some_and(|finding| finding.edited || finding.deleted))
-            .count();
-        let (status, color) = match findings.sent {
-            Some(true) => ("Approved".to_string(), Color::Success),
-            Some(false) => ("Sent to the agent review".to_string(), Color::Accent),
-            None => ("Gate 2 · waiting on you".to_string(), Color::Warning),
-        };
-        let done = findings.sent.is_some();
         Some(
             v_flex()
                 .w_full()
                 .border_b_1()
                 .border_color(colors.border_variant)
                 .bg(colors.surface_background)
-                .child(
-                    h_flex()
-                        .w_full()
-                        .px_3()
-                        .py_2()
-                        .gap_3()
-                        .child(Label::new(status).size(LabelSize::Small).color(color))
-                        .child(
-                            div().flex_1().min_w_0().child(
-                                Label::new(format!(
-                                    "{inline} on diff lines · {} general · {edited} changed by you · your own comments go too",
-                                    findings.general.len()
-                                ))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .truncate(),
-                            ),
-                        )
-                        .child(
-                            Button::new("findings-send", "Send feedback")
-                                .style(ButtonStyle::Outlined)
-                                .label_size(LabelSize::Small)
-                                .disabled(done)
-                                .on_click(cx.listener(|this, _, window, cx| this.send_findings(false, window, cx))),
-                        )
-                        .child(
-                            Button::new("findings-approve", "Approve")
-                                .style(ButtonStyle::Filled)
-                                .label_size(LabelSize::Small)
-                                .start_icon(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Success))
-                                .disabled(done)
-                                .on_click(cx.listener(|this, _, window, cx| this.send_findings(true, window, cx))),
-                        ),
-                )
-                .children(self.render_findings_index(cx))
+                .children(self.render_draft_bar(cx))
+                .children(self.render_findings_index(cx).map(|index| div().pt_2().child(index)))
                 .when(!findings.general.is_empty(), |header| {
                     header.child(
                         v_flex()
@@ -1093,6 +1277,7 @@ impl Render for ChapterDiffView {
         v_flex()
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            .children(self.render_draft_bar(cx))
             .child(self.render_intro(window, cx))
             .child(div().flex_1().min_h_0().child(self.editor.clone()))
             .child(self.render_nav(cx))

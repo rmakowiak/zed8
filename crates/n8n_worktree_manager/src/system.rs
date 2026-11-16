@@ -91,6 +91,8 @@ impl Output {
 pub trait System: Send + Sync {
     fn run(&self, command: &Command) -> Result<Output>;
     fn sleep(&self, duration: Duration);
+    /// False when another program listens on the TCP port.
+    fn port_free(&self, port: u16) -> bool;
 }
 
 pub struct RealSystem;
@@ -135,6 +137,12 @@ impl System for RealSystem {
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
     }
+
+    fn port_free(&self, port: u16) -> bool {
+        // Docker publishes ports on all interfaces, so a bind there fails
+        // while any container holds the port.
+        std::net::TcpListener::bind(("0.0.0.0", port)).is_ok()
+    }
 }
 
 /// Records every command and answers with the first rule whose prefix
@@ -144,12 +152,19 @@ impl System for RealSystem {
 pub struct FakeSystem {
     commands: Mutex<Vec<Command>>,
     rules: Mutex<Vec<(String, Output)>>,
+    busy_ports: Mutex<Vec<u16>>,
 }
 
 impl FakeSystem {
     pub fn respond(&self, prefix: &str, output: Output) {
         if let Ok(mut rules) = self.rules.lock() {
             rules.push((prefix.to_string(), output));
+        }
+    }
+
+    pub fn set_port_busy(&self, port: u16) {
+        if let Ok(mut busy) = self.busy_ports.lock() {
+            busy.push(port);
         }
     }
 
@@ -199,4 +214,11 @@ impl System for FakeSystem {
     }
 
     fn sleep(&self, _duration: Duration) {}
+
+    fn port_free(&self, port: u16) -> bool {
+        self.busy_ports
+            .lock()
+            .map(|busy| !busy.contains(&port))
+            .unwrap_or(true)
+    }
 }

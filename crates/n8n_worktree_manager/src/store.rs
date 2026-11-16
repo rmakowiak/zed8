@@ -46,10 +46,16 @@ impl Store {
     /// Takes the lowest free slot and writes the `meta.json` that `build`
     /// makes for it, under the lock. The written file is the claim, so two
     /// claims at the same time never get the same slot.
-    pub fn claim(&self, build: impl FnOnce(u16) -> Meta) -> Result<Meta> {
+    /// `usable` can reject a slot that no worktree has, for example because
+    /// leftover containers still hold its ports.
+    pub fn claim(
+        &self,
+        usable: impl Fn(u16) -> bool,
+        build: impl FnOnce(u16) -> Meta,
+    ) -> Result<Meta> {
         let _lock = Lock::acquire(&self.wt_home.join("registry.lock"))?;
         let taken: BTreeSet<u16> = self.list()?.iter().map(|meta| meta.slot).collect();
-        let Some(slot) = (0..MAX_SLOTS).find(|slot| !taken.contains(slot)) else {
+        let Some(slot) = (0..MAX_SLOTS).find(|slot| !taken.contains(slot) && usable(*slot)) else {
             bail!(
                 "No free slot left (0-{} are all in use). Tear down a worktree first.",
                 MAX_SLOTS - 1

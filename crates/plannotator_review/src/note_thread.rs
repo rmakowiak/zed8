@@ -11,7 +11,7 @@ use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, Render,
     SharedString, Subscription, Window, px,
 };
-use ui::{TintColor, Tooltip, prelude::*};
+use ui::{Checkbox, TintColor, ToggleState, Tooltip, prelude::*};
 
 /// The saved state of one thread, in `~/.plannotator/zed-drafts/<guide id>.json`.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -24,6 +24,8 @@ pub enum NoteThreadEvent {
     RepliesChanged,
     /// A finding was edited, deleted or restored. `text` is `None` when it is deleted.
     FindingChanged { id: String, text: Option<String> },
+    /// You ticked or unticked the finding for the review draft.
+    DraftToggled { add: bool },
 }
 
 /// A finding of the agent review, from a Plannotator external annotation.
@@ -50,6 +52,8 @@ pub struct NoteThread {
     /// The number of the finding in the index of the findings tab.
     index: Option<usize>,
     editing: bool,
+    /// The finding is ticked in the review draft.
+    in_draft: bool,
 }
 
 impl NoteThread {
@@ -84,6 +88,7 @@ impl NoteThread {
             finding: None,
             index: None,
             editing: false,
+            in_draft: false,
         }
     }
 
@@ -104,6 +109,34 @@ impl NoteThread {
         self.finding.as_ref()
     }
 
+    pub fn set_in_draft(&mut self, in_draft: bool, cx: &mut Context<Self>) {
+        if self.in_draft != in_draft {
+            self.in_draft = in_draft;
+            cx.notify();
+        }
+    }
+
+    pub fn in_draft(&self) -> bool {
+        self.in_draft
+    }
+
+    /// The finding as an item of the review draft, with your edits.
+    pub fn draft_item(&self) -> Option<crate::review_round::Item> {
+        let finding = self.finding.as_ref().filter(|finding| !finding.deleted)?;
+        let on_file = !self.file.is_empty();
+        Some(crate::review_round::Item {
+            key: format!("agent:{}", finding.id),
+            source: crate::review_round::Source::Agent,
+            path: on_file.then(|| self.file.clone()),
+            line: (on_file && self.note.line_start > 0).then_some(self.note.line_start),
+            line_end: (on_file && self.note.line_end > self.note.line_start).then_some(self.note.line_end),
+            severity: self.note.severity.clone(),
+            body: self.note.text.clone(),
+            include: true,
+            ..Default::default()
+        })
+    }
+
     pub fn set_index(&mut self, index: usize, cx: &mut Context<Self>) {
         self.index = Some(index);
         cx.notify();
@@ -111,6 +144,11 @@ impl NoteThread {
 
     pub fn file(&self) -> &str {
         &self.file
+    }
+
+    /// The severity of an agent review finding.
+    pub fn severity(&self) -> Option<&str> {
+        self.finding.as_ref().and(self.note.severity.as_deref())
     }
 
     pub fn line_start(&self) -> u32 {
@@ -342,6 +380,7 @@ impl Render for NoteThread {
                 .weight(FontWeight::SEMIBOLD)
                 .color(Color::Accent),
             )
+            .children(self.severity().map(|severity| crate::controls::severity_chip(severity, cx)))
             .when(!collapsed, |header| {
                 header
                     .child(div().flex_1())
@@ -399,6 +438,21 @@ impl Render for NoteThread {
                     )
                 })
         });
+        let in_draft = self.in_draft;
+        let tick = finding.as_ref().filter(|finding| !finding.deleted).map(|_| {
+            Checkbox::new("finding-in-draft", if in_draft { ToggleState::Selected } else { ToggleState::Unselected })
+                .tooltip(Tooltip::text(if in_draft {
+                    "In the review draft. Untick to take it out."
+                } else {
+                    "Add to the review draft"
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.in_draft = !in_draft;
+                    cx.emit(NoteThreadEvent::DraftToggled { add: !in_draft });
+                    cx.notify();
+                }))
+        });
+        let border = if in_draft { accent.opacity(0.7) } else { accent.opacity(0.35) };
         v_flex()
             .max_w(px(820.))
             .flex_1()
@@ -409,10 +463,19 @@ impl Render for NoteThread {
             .gap_1()
             .rounded_md()
             .border_1()
-            .border_color(accent.opacity(0.35))
-            .bg(accent.opacity(0.06))
+            .border_color(border)
+            .bg(accent.opacity(if in_draft { 0.1 } else { 0.06 }))
             .shadow_xs()
-            .child(header)
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .children(tick)
+                    .child(div().flex_1().min_w_0().child(header))
+                    .when(in_draft, |row| {
+                        row.child(Label::new("in draft").size(LabelSize::XSmall).color(Color::Accent))
+                    }),
+            )
             .when(!collapsed, |thread| {
                 thread
                     .child(

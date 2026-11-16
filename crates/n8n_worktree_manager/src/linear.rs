@@ -154,9 +154,14 @@ pub struct ProjectSummary {
     pub progress: f64,
     /// True for a project that I am a member of.
     pub mine: bool,
+    #[serde(default)]
+    pub lead_is_me: bool,
+    /// The key of the project's first team, such as CONTEXT.
+    #[serde(default)]
+    pub team: Option<String>,
 }
 
-const PROJECT_FIELDS: &str = "id name url state progress";
+const PROJECT_FIELDS: &str = "id name url state progress lead { isMe } teams(first: 1) { nodes { key } }";
 
 impl Linear {
     /// My projects. With a search text: my matching projects first, then
@@ -194,11 +199,67 @@ impl Linear {
     pub fn project(&self, id: &str) -> Result<Value> {
         let data = self.query(
             &format!(
-                "query($id: String!) {{ project(id: $id) {{ {PROJECT_FIELDS} description targetDate lead {{ name }} projectMilestones {{ nodes {{ name targetDate }} }} issues(first: 100) {{ nodes {{ {ISSUE_FIELDS} }} }} documents {{ nodes {{ title url }} }} projectUpdates(first: 1) {{ nodes {{ body createdAt user {{ name }} }} }} }} }}"
+                "query($id: String!) {{ project(id: $id) {{ {PROJECT_FIELDS} description targetDate lead {{ name }} projectMilestones {{ nodes {{ name targetDate progress sortOrder }} }} issues(first: 100) {{ nodes {{ {ISSUE_FIELDS} projectMilestone {{ name }} }} }} documents {{ nodes {{ title url }} }} projectUpdates(first: 1) {{ nodes {{ body createdAt user {{ name }} }} }} }} }}"
             ),
             json!({ "id": id }),
         )?;
         not_null(&data["project"], &format!("No Linear project {id}"))
+    }
+
+    /// The project of `project`, typed for a panel. Issues keep the order
+    /// of Linear.
+    pub fn project_view(&self, id: &str) -> Result<ProjectView> {
+        let project = self.project(id)?;
+        // Linear returns the milestones in no useful order.
+        let mut milestone_nodes = nodes(&project["projectMilestones"]);
+        milestone_nodes.sort_by(|a, b| {
+            let order = |node: &Value| node["sortOrder"].as_f64().unwrap_or_default();
+            order(a).total_cmp(&order(b))
+        });
+        let milestones = milestone_nodes
+            .iter()
+            .map(|node| Milestone {
+                name: text(&node["name"]).unwrap_or_default(),
+                percent: node["progress"].as_f64().unwrap_or_default(),
+                target_date: text(&node["targetDate"]),
+            })
+            .collect();
+        let issues = nodes(&project["issues"])
+            .iter()
+            .map(|node| ProjectIssue {
+                issue: issue_summary(node),
+                milestone: text(&node["projectMilestone"]["name"]),
+                finished: matches!(
+                    node["state"]["type"].as_str(),
+                    Some("completed" | "canceled" | "duplicate")
+                ),
+            })
+            .collect();
+        let documents = nodes(&project["documents"])
+            .iter()
+            .map(|node| Link {
+                title: text(&node["title"]).unwrap_or_default(),
+                url: text(&node["url"]).unwrap_or_default(),
+            })
+            .collect();
+        let latest_update = nodes(&project["projectUpdates"])
+            .first()
+            .map(|node| ProjectUpdate {
+                author: text(&node["user"]["name"]).unwrap_or_default(),
+                created_at: text(&node["createdAt"]).unwrap_or_default(),
+                body: text(&node["body"]).unwrap_or_default(),
+            });
+        Ok(ProjectView {
+            summary: project_summary(&project, false),
+            name: text(&project["name"]).unwrap_or_default(),
+            description: text(&project["description"]).filter(|text| !text.trim().is_empty()),
+            target_date: text(&project["targetDate"]),
+            lead: text(&project["lead"]["name"]),
+            milestones,
+            issues,
+            documents,
+            latest_update,
+        })
     }
 
     /// One issue for the preview: description, sub-issues, comments, links.
@@ -206,7 +267,7 @@ impl Linear {
         let key = key.trim().to_uppercase();
         let data = self.query(
             &format!(
-                "query($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} description createdAt updatedAt parent {{ identifier title }} children {{ nodes {{ identifier title state {{ name }} }} }} comments {{ nodes {{ body createdAt user {{ name }} }} }} attachments {{ nodes {{ title url }} }} }} }}"
+                "query($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} assignee {{ isMe }} projectMilestone {{ name progress }} project {{ targetDate documents {{ nodes {{ title url }} }} }} description createdAt updatedAt parent {{ identifier title }} children {{ nodes {{ identifier title state {{ name }} }} }} comments {{ nodes {{ body createdAt user {{ name }} }} }} attachments {{ nodes {{ title url }} }} }} }}"
             ),
             json!({ "id": key }),
         )?;
@@ -229,7 +290,54 @@ fn project_summary(node: &Value, mine: bool) -> ProjectSummary {
         state: text(&node["state"]).unwrap_or_default(),
         progress: node["progress"].as_f64().unwrap_or_default(),
         mine,
+        lead_is_me: node["lead"]["isMe"].as_bool().unwrap_or_default(),
+        team: nodes(&node["teams"])
+            .first()
+            .and_then(|team| text(&team["key"])),
     }
+}
+
+/// A project for the Work panel and its preview tab.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectView {
+    pub summary: ProjectSummary,
+    pub name: String,
+    pub description: Option<String>,
+    pub target_date: Option<String>,
+    pub lead: Option<String>,
+    pub milestones: Vec<Milestone>,
+    pub issues: Vec<ProjectIssue>,
+    pub documents: Vec<Link>,
+    pub latest_update: Option<ProjectUpdate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Milestone {
+    pub name: String,
+    /// From 0 to 100. A project's progress is from 0 to 1.
+    pub percent: f64,
+    pub target_date: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectIssue {
+    pub issue: IssueSummary,
+    pub milestone: Option<String>,
+    /// Completed, canceled or a duplicate.
+    pub finished: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectUpdate {
+    pub author: String,
+    pub created_at: String,
+    pub body: String,
 }
 
 /// The result of `start_issue`.
@@ -246,6 +354,16 @@ impl Linear {
     /// Moves an issue to the "In Progress" state of its team. A team without
     /// that name gets its first "started" state.
     pub fn start_issue(&self, key: &str) -> Result<StartedIssue> {
+        self.start_issue_with(key, true)
+    }
+
+    /// The issue's key, title and branch, with no write: for a worktree on
+    /// someone else's issue, for example to review it.
+    pub fn issue_for_start(&self, key: &str) -> Result<StartedIssue> {
+        self.start_issue_with(key, false)
+    }
+
+    fn start_issue_with(&self, key: &str, move_issue: bool) -> Result<StartedIssue> {
         let key = key.trim().to_uppercase();
         let data = self.query(
             "query($id: String!) { issue(id: $id) { id identifier title branchName state { id name type } team { states { nodes { id name type position } } } } }",
@@ -262,7 +380,7 @@ impl Linear {
             moved: false,
         };
         let state_type = issue["state"]["type"].as_str().unwrap_or_default();
-        if matches!(state_type, "started" | "completed" | "canceled") {
+        if !move_issue || matches!(state_type, "started" | "completed" | "canceled") {
             return Ok(started);
         }
         let mut states = nodes(&issue["team"]["states"]);
@@ -310,6 +428,7 @@ fn issue_summary(node: &Value) -> IssueSummary {
         identifier: text(&node["identifier"]).unwrap_or_default(),
         title: text(&node["title"]).unwrap_or_default(),
         status: text(&node["state"]["name"]).unwrap_or_default(),
+        status_type: text(&node["state"]["type"]).unwrap_or_default(),
         project: text(&node["project"]["name"]),
         url: text(&node["url"]).unwrap_or_default(),
         branch_name: text(&node["branchName"]),
@@ -327,6 +446,10 @@ pub struct IssueSummary {
     pub identifier: String,
     pub title: String,
     pub status: String,
+    /// The Linear state type: triage, backlog, unstarted, started,
+    /// completed or canceled. Caches from before it have none.
+    #[serde(default)]
+    pub status_type: String,
     pub project: Option<String>,
     pub url: String,
     pub branch_name: Option<String>,
@@ -376,6 +499,9 @@ pub struct IssueRow {
     pub worktree: Option<String>,
     /// The setup summary of the worktree: "pending", "failed at install", "done".
     pub setup: Option<String>,
+    /// The setup steps done and the steps it runs. A worktree from before
+    /// the setup record counts as done.
+    pub setup_progress: Option<(usize, usize)>,
 }
 
 /// Links each issue to its worktree: by the `issue` field of `meta.json`,
@@ -405,6 +531,10 @@ pub fn join(issues: Vec<IssueSummary>, worktrees: &[crate::model::Meta]) -> Vec<
                         .as_ref()
                         .map(|setup| setup.summary())
                         .unwrap_or_else(|| "done".to_string())
+                }),
+                setup_progress: worktree.map(|meta| match &meta.setup {
+                    Some(setup) => setup.progress(),
+                    None => (crate::model::Step::ALL.len(), crate::model::Step::ALL.len()),
                 }),
                 issue,
             }
