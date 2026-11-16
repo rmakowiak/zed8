@@ -65,7 +65,6 @@ const SEARCH_DELAY: Duration = Duration::from_millis(300);
 enum Tab {
     UpNext,
     Project,
-    Reviews,
 }
 
 struct ActionsMenu {
@@ -103,10 +102,6 @@ pub struct WorkPanel {
     project: Option<(ProjectView, Vec<IssueRow>)>,
     project_loading: bool,
     show_finished: bool,
-    /// The PRs you review or wrote, for the Reviews tab.
-    reviews: Option<Vec<crate::reviews::ReviewRow>>,
-    reviews_error: Option<String>,
-    _reviews_task: Task<()>,
     _refresh_task: Task<()>,
     _local_task: Task<()>,
     _search_task: Task<()>,
@@ -189,9 +184,6 @@ impl WorkPanel {
             project: None,
             project_loading: false,
             show_finished: false,
-            reviews: None,
-            reviews_error: None,
-            _reviews_task: Task::ready(()),
             _refresh_task: refresh_task,
             _local_task: Task::ready(()),
             _search_task: Task::ready(()),
@@ -247,7 +239,6 @@ impl WorkPanel {
                         panel.synced_at = Some(Instant::now());
                         panel.error = None;
                         panel.load_prs(cx);
-                        panel.load_reviews(cx);
                     }
                     Err(error) => panel.error = Some(format!("{error:#}")),
                 }
@@ -332,7 +323,6 @@ impl WorkPanel {
                 .into_iter()
                 .flat_map(|(_, rows)| rows)
                 .collect(),
-            Tab::Reviews => Vec::new(),
         }
     }
 
@@ -488,143 +478,9 @@ impl WorkPanel {
         cx.notify();
     }
 
-    /// The PRs of the Reviews tab, from GitHub and the review rounds.
-    fn load_reviews(&mut self, cx: &mut Context<Self>) {
-        let Some(manager) = self.manager.clone() else {
-            return;
-        };
-        self._reviews_task = cx.spawn(async move |this, cx| {
-            let rows = cx
-                .background_spawn(async move {
-                    let worktrees: Vec<(String, String)> = manager
-                        .list()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|meta| (meta.name, meta.branch))
-                        .collect();
-                    let reviews_dir = util::paths::home_dir().join("workspace").join("n8n-reviews");
-                    crate::reviews::load(&reviews_dir, &worktrees)
-                })
-                .await;
-            this.update(cx, |panel, cx| {
-                match rows {
-                    Ok(rows) => {
-                        panel.reviews = Some(rows);
-                        panel.reviews_error = None;
-                    }
-                    Err(error) => panel.reviews_error = Some(format!("{error:#}")),
-                }
-                cx.notify();
-            })
-            .ok();
-        });
-    }
-
-    fn waiting_reviews(&self) -> usize {
-        self.reviews
-            .as_ref()
-            .map(|rows| rows.iter().filter(|row| row.group == crate::reviews::ReviewGroup::WaitsOnYou).count())
-            .unwrap_or_default()
-    }
-
-    fn open_review(&mut self, row: &crate::reviews::ReviewRow, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(manager) = self.manager.clone() else {
-            return;
-        };
-        match row.worktree.clone() {
-            Some(name) => start::open_worktree(self.workspace.clone(), manager, name, false, false, window, cx),
-            None => start::start_review(self.workspace.clone(), manager, row.number, row.branch.clone(), window, cx),
-        }
-    }
-
-    fn render_reviews(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        use crate::reviews::ReviewGroup;
-        let mut elements = Vec::new();
-        if let Some(error) = &self.reviews_error {
-            elements.push(
-                div()
-                    .px_3()
-                    .py_1()
-                    .child(Label::new(error.clone()).size(LabelSize::Small).color(Color::Error))
-                    .into_any_element(),
-            );
-        }
-        let Some(rows) = &self.reviews else {
-            elements.push(section("Loading the PRs…").into_any_element());
-            return elements;
-        };
-        let hover = cx.theme().colors().ghost_element_hover;
-        for group in [ReviewGroup::WaitsOnYou, ReviewGroup::WaitsOnAuthor, ReviewGroup::Yours] {
-            let group_rows: Vec<&crate::reviews::ReviewRow> = rows.iter().filter(|row| row.group == group).collect();
-            elements.push(section(format!("{} · {}", group.title(), group_rows.len())).into_any_element());
-            if group_rows.is_empty() {
-                elements.push(
-                    div()
-                        .px_3()
-                        .pb_1p5()
-                        .child(Label::new("Nothing here").size(LabelSize::XSmall).color(Color::Muted))
-                        .into_any_element(),
-                );
-            }
-            for row in group_rows {
-                let open_row = row.clone();
-                let url = row.url.clone();
-                let label = if row.worktree.is_some() { "Open review" } else { "Start review" };
-                let dot = match group {
-                    ReviewGroup::WaitsOnYou => Color::Warning,
-                    ReviewGroup::WaitsOnAuthor => Color::Muted,
-                    ReviewGroup::Yours => Color::Success,
-                };
-                elements.push(
-                    v_flex()
-                        .id(("review-row", row.number as usize))
-                        .mx_1p5()
-                        .px_1p5()
-                        .py_1()
-                        .gap_0p5()
-                        .rounded_md()
-                        .hover(move |style| style.bg(hover))
-                        .child(
-                            h_flex()
-                                .gap_1p5()
-                                .child(Label::new(format!("#{}", row.number)).size(LabelSize::Small).weight(gpui::FontWeight::SEMIBOLD))
-                                .child(div().flex_1().min_w_0().child(Label::new(row.title.clone()).size(LabelSize::Small).color(Color::Muted).truncate()))
-                                .when(group != ReviewGroup::Yours, |line| {
-                                    line.child(Label::new(row.author.clone()).size(LabelSize::XSmall).color(Color::Muted))
-                                }),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_1p5()
-                                .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(dot))
-                                .child(div().flex_1().min_w_0().child(Label::new(row.state.clone()).size(LabelSize::XSmall).color(Color::Muted).truncate()))
-                                .child(
-                                    IconButton::new(("review-on-github", row.number as usize), IconName::ArrowUpRight)
-                                        .icon_size(IconSize::XSmall)
-                                        .icon_color(Color::Muted)
-                                        .tooltip(ui::Tooltip::text("Opens the PR on GitHub"))
-                                        .on_click(move |_, _, cx| cx.open_url(&url)),
-                                )
-                                .child(
-                                    Button::new(("review-open", row.number as usize), label)
-                                        .style(ButtonStyle::Outlined)
-                                        .label_size(LabelSize::XSmall)
-                                        .on_click(cx.listener(move |panel, _, window, cx| panel.open_review(&open_row, window, cx))),
-                                ),
-                        )
-                        .into_any_element(),
-                );
-            }
-        }
-        elements
-    }
-
     fn show_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
         self.picker_open = false;
-        if tab == Tab::Reviews {
-            self.load_reviews(cx);
-        }
         if tab == Tab::Project && self.my_projects.is_none() {
             self.load_my_projects(cx);
         }
@@ -787,20 +643,6 @@ impl WorkPanel {
             )
             .child(tab_button("work-panel-tab-up-next", "Up next", Tab::UpNext, cx))
             .child(tab_button("work-panel-tab-project", "Project", Tab::Project, cx))
-            .child(
-                h_flex()
-                    .child(tab_button("work-panel-tab-reviews", "Reviews", Tab::Reviews, cx))
-                    .when(self.waiting_reviews() > 0, |tab| {
-                        tab.child(
-                            div()
-                                .ml_0p5()
-                                .px_1()
-                                .rounded_full()
-                                .bg(cx.theme().status().warning.opacity(0.25))
-                                .child(Label::new(self.waiting_reviews().to_string()).size(LabelSize::XSmall).color(Color::Warning)),
-                        )
-                    }),
-            )
     }
 
     fn input_box(&self, editor: &Entity<Editor>, cx: &App) -> Div {
@@ -1195,7 +1037,6 @@ impl Render for WorkPanel {
         let body = match self.tab {
             Tab::UpNext => self.render_up_next(cx),
             Tab::Project => self.render_project_rows(cx),
-            Tab::Reviews => self.render_reviews(cx),
         };
         let top = match self.tab {
             Tab::UpNext => div()
@@ -1203,7 +1044,6 @@ impl Render for WorkPanel {
                 .child(self.input_box(&self.filter, cx))
                 .into_any_element(),
             Tab::Project => self.render_picker_button(cx).into_any_element(),
-            Tab::Reviews => div().into_any_element(),
         };
         v_flex()
             .key_context("WorkPanel")

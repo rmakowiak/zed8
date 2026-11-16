@@ -13,6 +13,7 @@ path = "src/work_panel.rs"
 doctest = false
 
 [dependencies]
+agent_ui.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 editor.workspace = true
@@ -21,7 +22,6 @@ markdown.workspace = true
 menu.workspace = true
 n8n_worktree_manager.workspace = true
 notifications.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 task.workspace = true
 terminal_view.workspace = true

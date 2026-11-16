@@ -303,8 +303,13 @@ impl Manager {
             linear.issue_for_start(key)?
         };
         let mut options = CreateOptions::new(&started.identifier.to_lowercase());
-        if !started.branch_name.is_empty() {
-            options.branch = Some(started.branch_name.clone());
+        // A remote agent such as catbot opens its PR on its own branch. The
+        // worktree goes on that branch, not on a new Linear branch.
+        let pr_branch = self.open_pr_branch(&started.identifier, &started.branch_name)?;
+        match pr_branch {
+            Some(branch) => options.branch = Some(branch),
+            None if !started.branch_name.is_empty() => options.branch = Some(started.branch_name.clone()),
+            None => {}
         }
         options.issue = Some(started.identifier.clone());
         let meta = self.create(options)?;
@@ -318,6 +323,65 @@ impl Manager {
             );
         }
         Ok(meta)
+    }
+
+    /// The branch of an open PR that names the issue, from this repository.
+    /// A PR on the Linear branch wins; else the newest PR.
+    fn open_pr_branch(&self, key: &str, linear_branch: &str) -> Result<Option<String>> {
+        let output = self.system.run(&Command::new("gh").args([
+            "pr",
+            "list",
+            "--repo",
+            "n8n-io/n8n",
+            "--state",
+            "open",
+            "--search",
+            key,
+            "--json",
+            "number,headRefName,isCrossRepository,title,body",
+            "--limit",
+            "10",
+        ]))?;
+        if !output.success {
+            // Without GitHub, the Linear branch still works.
+            eprintln!("warning: gh pr list for {key} failed: {}", output.stderr.trim());
+            return Ok(None);
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OpenPr {
+            head_ref_name: String,
+            #[serde(default)]
+            is_cross_repository: bool,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            body: String,
+        }
+        let prs: Vec<OpenPr> = match output.stdout.trim() {
+            "" => Vec::new(),
+            text => serde_json::from_str(text).with_context(|| format!("reading the open PRs of {key}"))?,
+        };
+        let names_key = |text: &str| {
+            let upper = text.to_uppercase();
+            upper.match_indices(key).any(|(at, _)| {
+                let after = upper[at + key.len()..].chars().next();
+                let before = upper[..at].chars().next_back();
+                !after.is_some_and(|c| c.is_ascii_alphanumeric())
+                    && !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+        };
+        let candidates: Vec<OpenPr> = prs
+            .into_iter()
+            .filter(|pr| {
+                !pr.is_cross_repository
+                    && (names_key(&pr.title) || names_key(&pr.body) || names_key(&pr.head_ref_name))
+            })
+            .collect();
+        if candidates.iter().any(|pr| !linear_branch.is_empty() && pr.head_ref_name == linear_branch) {
+            return Ok(Some(linear_branch.to_string()));
+        }
+        Ok(candidates.into_iter().next().map(|pr| pr.head_ref_name))
     }
 
     /// The context text for the worktree that contains `dir`, or an empty

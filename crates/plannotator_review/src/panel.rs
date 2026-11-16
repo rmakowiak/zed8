@@ -48,6 +48,9 @@ actions!(
 
 mod draft;
 
+/// The `pid` of `AgentFiles` read from a finished review's saved findings.
+const SAVED_FINDINGS: i32 = -1;
+
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How long a new thread may take before Claude runs in it.
 const CLAUDE_START_TIME: Duration = Duration::from_secs(20);
@@ -1092,7 +1095,7 @@ impl ReviewPanel {
             let view = task.await?;
             let worktree = root.display().to_string();
             view.update_in(cx, |view, window, cx| {
-                view.set_findings(session, http, worktree, general, window, cx);
+                view.set_findings(Some(session), http, worktree, general, window, cx);
                 apply_findings_then(view, then, window, cx);
             })?;
             anyhow::Ok(())
@@ -1110,8 +1113,7 @@ impl ReviewPanel {
     /// the Agent review card.
     fn load_agent_files(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.findings_session(&self.claude_terminals(cx)) else {
-            self.agent_files = None;
-            self._agent_files_load = None;
+            self.load_saved_agent_files(cx);
             return;
         };
         let loaded = self.agent_files.as_ref().is_some_and(|files| files.pid == session.pid);
@@ -1152,6 +1154,91 @@ impl ReviewPanel {
         self._agent_files_load = Some((pid, task));
     }
 
+    /// The files and findings of a finished agent review, from its saved
+    /// findings. `pid` -1 marks them.
+    fn load_saved_agent_files(&mut self, cx: &mut Context<Self>) {
+        let Some(saved) = self.state.agent_saved.clone().filter(|saved| !saved.findings.is_empty()) else {
+            self.agent_files = None;
+            self._agent_files_load = None;
+            return;
+        };
+        let count = saved.findings.len();
+        let loaded = self.agent_files.as_ref().is_some_and(|files| {
+            files.pid == SAVED_FINDINGS
+                && files.diffs.iter().map(|diff| diff.notes.len()).sum::<usize>() + files.general == count
+        });
+        let loading = self._agent_files_load.as_ref().is_some_and(|(pid, _)| *pid == SAVED_FINDINGS);
+        if loaded || loading {
+            return;
+        }
+        let Some(root) = self.state.roots.first().cloned() else {
+            return;
+        };
+        let base = self.findings_base();
+        let task = cx.spawn(async move |this, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(async move { findings::changed_files(&root, &base) })
+                .await;
+            this.update(cx, |this, cx| {
+                this._agent_files_load = None;
+                match files {
+                    Ok(files) => {
+                        let (diffs, general) = findings::split(&saved.findings, &files);
+                        this.agent_files = Some(AgentFiles { pid: SAVED_FINDINGS, diffs, general: general.len() });
+                    }
+                    Err(error) => log::warn!("plannotator: cannot list the changed files: {error:#}"),
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
+        self._agent_files_load = Some((SAVED_FINDINGS, task));
+    }
+
+    /// Opens the saved findings of a finished agent review in a findings tab.
+    fn open_saved_findings(&mut self, then: FindingsThen, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(root), Some(workspace), Some(saved)) =
+            (self.state.roots.first().cloned(), self.workspace.upgrade(), self.state.agent_saved.clone())
+        else {
+            return;
+        };
+        let pr = self.state.pr.as_ref().map(|pr| pr.number).unwrap_or_default();
+        let key = ChapterKey { guide_id: format!("findings-saved-{pr}"), chapter: 0 };
+        let existing = workspace.read(cx).items_of_type::<ChapterDiffView>(cx).find(|view| view.read(cx).key() == &key);
+        if let Some(view) = existing {
+            workspace.update(cx, |workspace, cx| workspace.activate_item(&view, true, true, window, cx));
+            view.update(cx, |view, cx| apply_findings_then(view, then, window, cx));
+            return;
+        }
+        let base = self.findings_base();
+        let title = format!("Findings · PR #{pr}");
+        let http = self.http.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let files = cx
+                .background_executor()
+                .spawn({
+                    let root = root.clone();
+                    let base = base.clone();
+                    async move { findings::changed_files(&root, &base) }
+                })
+                .await?;
+            let (diffs, general) = findings::split(&saved.findings, &files);
+            let intro = ChapterIntro { index: 0, count: 1, title: title.clone(), overview: String::new(), reviewed: false };
+            let task = workspace.update_in(cx, |workspace, window, cx| {
+                ChapterDiffView::open(key, title, intro, root.clone(), base, diffs, workspace, window, cx)
+            })?;
+            let view = task.await?;
+            let worktree = root.display().to_string();
+            view.update_in(cx, |view, window, cx| {
+                view.set_findings(None, http, worktree, general, window, cx);
+                apply_findings_then(view, then, window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn findings_base(&self) -> String {
         match self.state.pr.as_ref().map(|pr| pr.base_ref_name.as_str()) {
             Some(base) if !base.is_empty() => format!("origin/{base}"),
@@ -1162,8 +1249,8 @@ impl ReviewPanel {
     /// The Agent review card while gate 2 waits: Send feedback and Approve,
     /// then every changed file with its findings. A file opens the findings
     /// tab at that file.
-    fn render_agent_findings(&self, session: &Session, cx: &mut Context<Self>) -> AnyElement {
-        let view = self.findings_view(session, cx);
+    fn render_agent_findings(&self, session: Option<&Session>, cx: &mut Context<Self>) -> AnyElement {
+        let view = session.and_then(|session| self.findings_view(session, cx));
         let total = self
             .agent_files
             .as_ref()
@@ -1174,10 +1261,11 @@ impl ReviewPanel {
             .map(|round| round.included().filter(|item| item.key.starts_with("agent:")).count())
             .unwrap_or_default();
         let sent = view.as_ref().and_then(|view| view.read(cx).findings_sent());
-        let (status, color) = match sent {
-            Some(true) => ("Gate 2 done", Color::Success),
-            Some(false) => ("Sent to the agent review", Color::Accent),
-            None => ("Gate 2 · waits on you", Color::Warning),
+        let (status, color) = match (session.is_some(), sent) {
+            (false, _) => ("Saved review", Color::Muted),
+            (_, Some(true)) => ("Gate 2 done", Color::Success),
+            (_, Some(false)) => ("Sent to the agent review", Color::Accent),
+            (_, None) => ("Gate 2 · waits on you", Color::Warning),
         };
         let controls = h_flex()
             .w_full()
@@ -1196,27 +1284,47 @@ impl ReviewPanel {
                     .label_size(LabelSize::Small)
                     .tooltip(Tooltip::text("Opens the findings. Tick the ones that go into the review draft."))
                     .on_click({
-                        let session = session.clone();
-                        cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.open_findings(session.clone(), FindingsThen::Show, window, cx)
+                        let session = session.cloned();
+                        cx.listener(move |this, _: &ClickEvent, window, cx| match session.clone() {
+                            Some(session) => this.open_findings(session, FindingsThen::Show, window, cx),
+                            None => this.open_saved_findings(FindingsThen::Show, window, cx),
                         })
                     }),
             );
-        let files = self.agent_files.as_ref().filter(|files| files.pid == session.pid);
+        let summary = self.state.agent_saved.as_ref().and_then(|saved| saved.summary.clone()).map(|summary| {
+            v_flex()
+                .w_full()
+                .gap_1()
+                .child(Label::new("SUMMARY").size(LabelSize::XSmall).color(Color::Muted))
+                .children(summary.split("\n\n").map(|paragraph| {
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().colors().text_muted)
+                        .child(SharedString::from(paragraph.replace('`', "")))
+                }))
+        });
+        let files = self
+            .agent_files
+            .as_ref()
+            .filter(|files| files.pid == session.map_or(SAVED_FINDINGS, |session| session.pid));
         let rows: Vec<AnyElement> = files
             .map(|files| {
                 files
                     .diffs
                     .iter()
                     .enumerate()
+                    .filter(|(_, diff)| !diff.notes.is_empty())
                     .map(|(ix, diff)| {
-                        let session = session.clone();
+                        let session = session.cloned();
                         let file = diff.file.clone();
                         self.render_file_row(
                             ElementId::NamedInteger("agent-file".into(), ix as u64),
                             diff,
-                            move |this, window, cx| {
-                                this.open_findings(session.clone(), FindingsThen::ScrollTo(file.clone()), window, cx)
+                            move |this, window, cx| match session.clone() {
+                                Some(session) => {
+                                    this.open_findings(session, FindingsThen::ScrollTo(file.clone()), window, cx)
+                                }
+                                None => this.open_saved_findings(FindingsThen::ScrollTo(file.clone()), window, cx),
                             },
                             cx,
                         )
@@ -1225,24 +1333,33 @@ impl ReviewPanel {
             })
             .unwrap_or_default();
         let general = files.map(|files| files.general).unwrap_or_default();
+        let without_comments = files.map_or(0, |files| files.diffs.iter().filter(|diff| diff.notes.is_empty()).count());
         v_flex()
             .w_full()
             .gap_1p5()
             .pt_1p5()
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
+            .children(summary)
             .child(controls)
             .when(!rows.is_empty(), |list| {
                 list.child(
                     Label::new(if general > 0 {
-                        format!("FILES · {general} GENERAL COMMENTS IN THE TAB")
+                        format!("FILES WITH COMMENTS · {general} GENERAL IN THE TAB")
                     } else {
-                        "FILES".to_string()
+                        "FILES WITH COMMENTS".to_string()
                     })
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
                 )
                 .child(v_flex().w_full().gap_0p5().children(rows))
+                .when(without_comments > 0, |list| {
+                    list.child(
+                        Label::new(format!("{without_comments} more changed files without comments"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
             })
             .into_any_element()
     }
@@ -1645,9 +1762,11 @@ impl ReviewPanel {
                 })
             });
         let agent = (action == ReviewAction::AgentReview)
-            .then(|| self.findings_session(terminals))
-            .flatten()
-            .map(|session| self.render_agent_findings(&session, cx));
+            .then(|| match self.findings_session(terminals) {
+                Some(session) => Some(self.render_agent_findings(Some(&session), cx)),
+                None => self.state.agent_saved.is_some().then(|| self.render_agent_findings(None, cx)),
+            })
+            .flatten();
         let guided = has_review.then(|| {
             v_flex()
                 .w_full()

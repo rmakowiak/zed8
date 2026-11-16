@@ -115,7 +115,8 @@ pub enum DraftChange {
 
 /// Gate 2 of the agent review: the tab shows the whole PR with its findings.
 struct FindingsMode {
-    session: Session,
+    /// `None` for the findings that a finished agent review saved.
+    session: Option<Session>,
     http: Arc<dyn HttpClient>,
     worktree: String,
     /// The review body and the findings that are not on a diff line.
@@ -403,7 +404,7 @@ impl ChapterDiffView {
     /// Turns this tab into gate 2 of the agent review.
     pub fn set_findings(
         &mut self,
-        session: Session,
+        session: Option<Session>,
         http: Arc<dyn HttpClient>,
         worktree: String,
         general: Vec<ExternalAnnotation>,
@@ -432,7 +433,7 @@ impl ChapterDiffView {
     }
 
     pub fn findings_session_pid(&self) -> Option<i32> {
-        self.findings.as_ref().map(|findings| findings.session.pid)
+        self.findings.as_ref().and_then(|findings| findings.session.as_ref()).map(|session| session.pid)
     }
 
     /// Keeps an edit in the Plannotator session, so it survives a restart of Zed.
@@ -445,7 +446,10 @@ impl ChapterDiffView {
             return;
         };
         let http = findings.http.clone();
-        let url = format!("{}/api/external-annotations?id={id}", findings.session.url);
+        let Some(session) = &findings.session else {
+            return;
+        };
+        let url = format!("{}/api/external-annotations?id={id}", session.url);
         cx.background_spawn(async move {
             crate::client::send_json(&http, Method::PATCH, &url, &serde_json::json!({ "text": text })).await
         })
@@ -475,7 +479,10 @@ impl ChapterDiffView {
         // The review draft posts now, so the skill stops after gate 2.
         let message = if approved { format!("{}\n\n{message}", findings::ZED8_DRAFT_NOTE) } else { message };
         let http = findings.http.clone();
-        let url = format!("{}/api/feedback", findings.session.url);
+        let Some(session) = &findings.session else {
+            return;
+        };
+        let url = format!("{}/api/feedback", session.url);
         let workspace = self.workspace.clone();
         cx.spawn_in(window, async move |this, cx| {
             let body = serde_json::json!({ "approved": approved, "feedback": message, "annotations": [] });
@@ -674,16 +681,17 @@ impl ChapterDiffView {
         let (status, color, summary, ask, done, medium) = match &self.findings {
             Some(findings) => {
                 let (total, ticked) = self.findings_counts(cx).unwrap_or_default();
-                let (status, color) = match findings.sent {
-                    Some(true) => ("Done", Color::Success),
-                    Some(false) => ("Sent to the agent review", Color::Accent),
-                    None => ("Gate 2 · waits on you", Color::Warning),
+                let (status, color) = match (findings.session.is_some(), findings.sent) {
+                    (false, _) => ("Saved review", Color::Muted),
+                    (_, Some(true)) => ("Done", Color::Success),
+                    (_, Some(false)) => ("Sent to the agent review", Color::Accent),
+                    (_, None) => ("Gate 2 · waits on you", Color::Warning),
                 };
                 let untick_medium = self.finding_threads().any(|thread| {
                     let thread = thread.read(cx);
                     !thread.in_draft() && thread.severity().is_some_and(|severity| findings::severity_rank(severity) >= 3)
                 });
-                let open = findings.sent.is_none();
+                let open = findings.sent.is_none() && findings.session.is_some();
                 (status.to_string(), color, format!("{ticked} of {total} in draft"), open, open, untick_medium)
             }
             None => {

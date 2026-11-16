@@ -64,6 +64,14 @@ pub struct PanelState {
     pub since_sent: Option<(String, u32, bool)>,
     /// The fix thread wrote its answers for the newest sent round.
     pub answers: bool,
+    /// What a finished agent review saved in the review folder.
+    pub agent_saved: Option<SavedAgentReview>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SavedAgentReview {
+    pub summary: Option<String>,
+    pub findings: Vec<crate::findings::ExternalAnnotation>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -213,7 +221,22 @@ pub fn load_state(roots: Vec<PathBuf>, previous: PanelState) -> PanelState {
         (Some(round), Some(dir)) => dir.join("rounds").join(format!("round-{}.answers.json", round.number)).exists(),
         _ => false,
     };
+    let agent_saved = review_dir.as_deref().and_then(|dir| {
+        let findings = std::fs::read_to_string(dir.join("findings-merged.json"))
+            .ok()
+            .and_then(|json| {
+                crate::findings::saved_findings(&json)
+                    .map_err(|error| log::warn!("plannotator: cannot read findings-merged.json: {error:#}"))
+                    .ok()
+            })
+            .unwrap_or_default();
+        let summary = std::fs::read_to_string(dir.join("review.md"))
+            .ok()
+            .and_then(|text| crate::findings::saved_summary(&text));
+        (!findings.is_empty() || summary.is_some()).then_some(SavedAgentReview { summary, findings })
+    });
     PanelState {
+        agent_saved,
         review_dir,
         rounds,
         me,

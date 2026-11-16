@@ -4,7 +4,6 @@
 
 mod panel;
 mod preview;
-mod reviews;
 mod start;
 
 use gpui::{App, AppContext as _, KeyBinding, transparent_black};

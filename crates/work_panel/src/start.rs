@@ -66,22 +66,40 @@ pub(crate) fn ask_claude(
             .next()
             .map(|path| path.to_path_buf())
     });
-    spawn_claude(&workspace, cwd, Some(prompt), window, cx);
+    spawn_claude(&workspace, row.issue.identifier.clone(), cwd, Some(prompt), window, cx);
 }
 
+/// Starts Claude Code as a thread in the agent dock, named `title`. A
+/// project whose agent dock cannot hold a terminal thread gets a terminal tab.
 fn spawn_claude(
     workspace: &Entity<Workspace>,
+    title: String,
     cwd: Option<PathBuf>,
     prompt: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let command = match &prompt {
+        Some(prompt) => format!("claude '{}'", prompt.replace('\'', "'\\''")),
+        None => "claude".to_string(),
+    };
+    let started = workspace.update(cx, |workspace, cx| {
+        let agent_panel = workspace.panel::<agent_ui::AgentPanel>(cx)?;
+        let thread = agent_panel.update(cx, |panel, cx| {
+            panel.new_named_terminal(title.clone().into(), command, cwd.clone(), window, cx)
+        })?;
+        workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
+        Some(thread)
+    });
+    if started.is_some() {
+        return;
+    }
     let Some(panel) = workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx)) else {
         toast(&workspace.downgrade(), "Zed cannot open a terminal in this project.", cx);
         return;
     };
     let task = SpawnInTerminal {
-        label: "Claude Code".to_string(),
+        label: title,
         full_label: "claude".to_string(),
         command_label: "claude".to_string(),
         command: Some("claude".to_string()),
@@ -201,7 +219,7 @@ pub(crate) fn open_worktree(
             let finished = cx.update(|_, cx| terminal.read(cx).wait_for_completed_task(cx))?;
             let status = finished.await;
             if status.is_some_and(|status| status.success()) {
-                cx.update(|window, cx| spawn_claude(&opened, Some(checkout), None, window, cx))?;
+                cx.update(|window, cx| spawn_claude(&opened, name.to_uppercase(), Some(checkout), None, window, cx))?;
             }
             Ok(())
         })
@@ -453,35 +471,3 @@ impl EventEmitter<DismissEvent> for StartWorkModal {}
 
 impl ModalView for StartWorkModal {}
 
-/// Makes the `pr-<n>` worktree on the PR's branch, then opens it with its
-/// setup, for a review of someone else's PR.
-pub(crate) fn start_review(
-    workspace: WeakEntity<Workspace>,
-    manager: Arc<Manager>,
-    number: u64,
-    branch: String,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let name = format!("pr-{number}");
-    toast(&workspace, format!("Creating the worktree {name}…"), cx);
-    window
-        .spawn(cx, async move |cx| {
-            let created = cx
-                .background_spawn({
-                    let manager = manager.clone();
-                    let name = name.clone();
-                    async move {
-                        let mut options = n8n_worktree_manager::CreateOptions::new(&name);
-                        options.branch = Some(branch);
-                        manager.create(options)
-                    }
-                })
-                .await;
-            cx.update(|window, cx| match created {
-                Ok(meta) => open_worktree(workspace, manager, meta.name, true, false, window, cx),
-                Err(error) => toast(&workspace, format!("Cannot create {name}: {error:#}"), cx),
-            })
-        })
-        .detach_and_log_err(cx);
-}

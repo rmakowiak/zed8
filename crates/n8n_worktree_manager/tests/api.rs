@@ -882,6 +882,73 @@ fn pr_status_prefers_an_open_pr_of_the_meta_branch_over_a_closed_one_of_the_chec
     assert_eq!((pr.number, pr.state.as_str()), (2, "OPEN"));
 }
 
+fn issue_354() -> FakeTransport {
+    FakeTransport::with_answers([
+        r#"{"data":{"issue":{"id":"uuid-354","identifier":"CONTEXT-354","title":"Source health",
+            "branchName":"someone/context-354-source-health",
+            "state":{"id":"s-progress","name":"In Progress","type":"started"},
+            "team":{"states":{"nodes":[{"id":"s-progress","name":"In Progress","type":"started","position":2}]}}}}}"#,
+    ])
+}
+
+#[test]
+fn start_checks_out_the_branch_of_an_open_pr_for_the_issue() {
+    let setup = setup();
+    let linear = Linear::new(Box::new(issue_354()));
+    // A remote agent opened the PR on its own branch, not on the Linear branch.
+    setup.system.respond(
+        "gh pr list --repo n8n-io/n8n --state open --search CONTEXT-354",
+        Output::ok(
+            r#"[{"number":43792,"headRefName":"cat-bot/run-43400563449-1","isCrossRepository":false,
+                "title":"fix: Report source health","body":"Closes CONTEXT-354"}]"#,
+        ),
+    );
+
+    let meta = setup.manager.start(&linear, "CONTEXT-354", false).expect("start");
+
+    assert_eq!(meta.name, "context-354");
+    assert_eq!(meta.branch, "cat-bot/run-43400563449-1");
+    assert_eq!(meta.issue.as_deref(), Some("CONTEXT-354"));
+}
+
+#[test]
+fn start_keeps_the_linear_branch_without_a_pr_that_names_the_issue() {
+    let setup = setup();
+    let linear = Linear::new(Box::new(issue_354()));
+    setup
+        .system
+        .fail(&format!("git -C {} show-ref", setup.source.display()));
+    // Search finds a PR of another issue, and one from a fork.
+    setup.system.respond(
+        "gh pr list --repo n8n-io/n8n --state open --search CONTEXT-354",
+        Output::ok(
+            r#"[{"number":1,"headRefName":"other","isCrossRepository":false,"title":"CONTEXT-3540 other","body":""},
+                {"number":2,"headRefName":"fork-branch","isCrossRepository":true,"title":"CONTEXT-354","body":""}]"#,
+        ),
+    );
+
+    let meta = setup.manager.start(&linear, "CONTEXT-354", false).expect("start");
+
+    assert_eq!(meta.branch, "someone/context-354-source-health");
+}
+
+#[test]
+fn start_prefers_the_pr_on_the_linear_branch() {
+    let setup = setup();
+    let linear = Linear::new(Box::new(issue_354()));
+    setup.system.respond(
+        "gh pr list --repo n8n-io/n8n --state open --search CONTEXT-354",
+        Output::ok(
+            r#"[{"number":3,"headRefName":"cat-bot/run-1","isCrossRepository":false,"title":"CONTEXT-354 bot","body":""},
+                {"number":4,"headRefName":"someone/context-354-source-health","isCrossRepository":false,"title":"CONTEXT-354","body":""}]"#,
+        ),
+    );
+
+    let meta = setup.manager.start(&linear, "CONTEXT-354", false).expect("start");
+
+    assert_eq!(meta.branch, "someone/context-354-source-health");
+}
+
 #[test]
 fn start_without_the_move_reads_linear_and_writes_nothing() {
     let setup = setup();

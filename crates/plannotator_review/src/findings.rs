@@ -144,6 +144,55 @@ pub fn message(inline: &[ExportedReviewComment], general: &[String], worktree: &
     output
 }
 
+/// The findings that `pr-review` saved in `findings-merged.json`, as the
+/// annotations of a gate 2 session, so the card shows them after the session.
+pub fn saved_findings(json: &str) -> anyhow::Result<Vec<ExternalAnnotation>> {
+    // Lines are numbers or strings, depending on the run that wrote the file.
+    fn line(value: &serde_json::Value) -> Option<u32> {
+        match value {
+            serde_json::Value::Number(number) => number.as_u64().and_then(|line| u32::try_from(line).ok()),
+            serde_json::Value::String(text) => text.trim().parse().ok(),
+            _ => None,
+        }
+        .filter(|line| *line > 0)
+    }
+    let findings: Vec<serde_json::Value> = serde_json::from_str(json)?;
+    Ok(findings
+        .iter()
+        .map(|finding| {
+            let text = |key: &str| finding.get(key).and_then(|value| value.as_str()).unwrap_or_default().to_string();
+            let file = Some(text("file")).filter(|file| !file.is_empty());
+            let line_start = file.as_ref().and(finding.get("line").and_then(line));
+            ExternalAnnotation {
+                id: text("id"),
+                source: Some("pr-review".to_string()),
+                scope: Some(match (&file, line_start) {
+                    (Some(_), Some(_)) => "line",
+                    (Some(_), None) => "file",
+                    (None, _) => "general",
+                }
+                .to_string()),
+                line_start,
+                line_end: line_start.and(finding.get("end_line").and_then(line)).or(line_start),
+                file_path: file,
+                side: Some("new".to_string()),
+                text: text("comment"),
+                suggested_code: None,
+                severity: Some(text("severity")).filter(|severity| !severity.is_empty()),
+            }
+        })
+        .collect())
+}
+
+/// The "Summary" section of `review.md`, without its heading.
+pub fn saved_summary(review_md: &str) -> Option<String> {
+    let start = review_md.find("\n## Summary")?;
+    let body = &review_md[start + "\n## Summary".len()..];
+    let end = body.find("\n## ").unwrap_or(body.len());
+    let summary = body[..end].trim();
+    (!summary.is_empty()).then(|| summary.to_string())
+}
+
 /// The files that differ between the merge base of HEAD and `base`, in git order.
 pub fn changed_files(root: &Path, base: &str) -> anyhow::Result<Vec<String>> {
     let git = |args: &[&str]| -> anyhow::Result<String> {
@@ -193,6 +242,35 @@ mod tests {
         assert_eq!(diffs[0].notes[0].severity.as_deref(), Some("High"));
         assert_eq!(diffs[0].notes[1].severity, None);
         assert_eq!(general_note(&general[0]).severity.as_deref(), Some("Low"));
+    }
+
+    #[test]
+    fn saved_findings_read_like_session_annotations() {
+        let json = r#"[
+            {"id":"rq-01","lens":"requirements","severity":"Medium","file":"a.vue","line":"163","end_line":"164","comment":"Clash first."},
+            {"id":"gr-02","severity":"Low","file":"b.ts","line":12,"comment":"Name it."},
+            {"id":"x","severity":"Low","file":"","line":"","comment":"General note."}
+        ]"#;
+        let findings = saved_findings(json).unwrap();
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0].id, "rq-01");
+        assert_eq!(findings[0].file_path.as_deref(), Some("a.vue"));
+        assert_eq!((findings[0].line_start, findings[0].line_end), (Some(163), Some(164)));
+        assert_eq!(findings[0].severity.as_deref(), Some("Medium"));
+        assert_eq!(findings[0].text, "Clash first.");
+        assert_eq!(findings[1].line_start, Some(12));
+        assert_eq!(findings[2].file_path, None);
+        assert_eq!(findings[2].scope.as_deref(), Some("general"));
+        let (diffs, general) = split(&findings, &["a.vue".into(), "b.ts".into()]);
+        assert_eq!(diffs.len(), 2);
+        assert_eq!(general.len(), 1);
+    }
+
+    #[test]
+    fn the_summary_is_the_section_under_its_heading() {
+        let md = "# Review: pr-1\n\nIntro.\n\n## Summary\n\nFirst.\n\nSecond.\n\n## Requirements\n\nNo.\n";
+        assert_eq!(saved_summary(md).as_deref(), Some("First.\n\nSecond."));
+        assert_eq!(saved_summary("# Review\n\nNo summary.\n"), None);
     }
 
     #[test]
